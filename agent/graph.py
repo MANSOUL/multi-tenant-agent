@@ -14,10 +14,11 @@ try:
         MAX_TOOL_ROUNDS,
         MODEL,
         SYSTEM_PROMPT,
+        TENANT_ID,
         TOOLS_DOC,
     )
     from .memory import load_context
-    from .tenant import tenant_db
+    from .tenant import is_own_tenant, tenant_db
     from .tools import make_tools
 except ImportError:  # 以脚本方式运行 python3 agent/app.py 时
     from config import (
@@ -26,10 +27,11 @@ except ImportError:  # 以脚本方式运行 python3 agent/app.py 时
         MAX_TOOL_ROUNDS,
         MODEL,
         SYSTEM_PROMPT,
+        TENANT_ID,
         TOOLS_DOC,
     )
     from memory import load_context
-    from tenant import tenant_db
+    from tenant import is_own_tenant, tenant_db
     from tools import make_tools
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -141,6 +143,10 @@ def build_graph(tenant: str):
 
 
 def chat(tenant: str, user_text: str) -> str:
+    # 单租户容器只服务自己的租户：网关路由错了也在这里挡掉，不读别人的库。
+    if TENANT_ID and not is_own_tenant(tenant):
+        raise RuntimeError(
+            f"这个容器只服务租户 {TENANT_ID}，不处理租户 {tenant} 的请求")
     if not API_KEY:
         raise RuntimeError("还没填 LLM_API_KEY：复制 .env.example 成 .env 再填")
     graph = build_graph(tenant)

@@ -8,11 +8,11 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
-    from .config import DATA_DIR, MODEL, PORT
+    from .config import DATA_DIR, MODEL, PORT, SINGLE_TENANT_MODE, TENANT_ID
     from .graph import chat
     from .tenant import get_tenant
 except ImportError:  # 以脚本方式运行 python3 agent/app.py 时
-    from config import DATA_DIR, MODEL, PORT
+    from config import DATA_DIR, MODEL, PORT, SINGLE_TENANT_MODE, TENANT_ID
     from graph import chat
     from tenant import get_tenant
 
@@ -65,6 +65,8 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/health":
             self._send(200, json.dumps(
                 {"ok": True, "model": MODEL, "engine": "langgraph",
+                 "tenant": TENANT_ID or None,
+                 "single_tenant": SINGLE_TENANT_MODE,
                  "sandbox_mode": os.environ.get(
                      "SANDBOX_MODE", "docker")}), "application/json")
         elif self.path == "/api/me":

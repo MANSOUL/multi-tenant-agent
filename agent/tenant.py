@@ -11,12 +11,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 try:
-    from .config import DATA_DIR, TOKEN_SECRET, TRUST_TENANT_HEADER
+    from .config import DATA_DIR, TENANT_ID, TOKEN_SECRET, TRUST_TENANT_HEADER
 except ImportError:  # 以脚本方式运行 python3 agent/app.py 时
-    from config import DATA_DIR, TOKEN_SECRET, TRUST_TENANT_HEADER
+    from config import DATA_DIR, TENANT_ID, TOKEN_SECRET, TRUST_TENANT_HEADER
 
 # 租户 id 只允许字母数字 _ - ，防止路径穿越和奇怪的租户名
 TENANT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def is_own_tenant(tenant: str) -> bool:
+    """单租户模式（TENANT_ID 已设）下，容器只认自己的租户。
+
+    一租户一容器后，进程级隔离已经由容器保证，这里是第二道防线：
+    万一网关把别的租户的请求错发到这个容器，请求会被挡掉而不是
+    读到别人的数据。TENANT_ID 为空时是老的多租户进程模式，不挡。
+    """
+    if not TENANT_ID:
+        return True
+    return tenant == TENANT_ID
 
 
 def tenant_dirs(tenant: str) -> tuple[Path, Path, Path]:
@@ -61,7 +73,7 @@ def verify_token(token: str) -> str | None:
         return None
     try:
         tenant, exp, sig = token.split(".")
-        if not TENANT_RE.match(tenant):
+        if not TENANT_RE.fullmatch(tenant):
             return None
         if int(exp) < int(datetime.now(timezone.utc).timestamp()):
             return None
@@ -76,11 +88,15 @@ def verify_token(token: str) -> str | None:
 
 
 def get_tenant(handler) -> str | None:
-    """从请求头拿租户身份：优先校验 token，其次信任网关转发的 X-Tenant-Id。"""
+    """从请求头拿租户身份：优先校验 token，其次信任网关转发的 X-Tenant-Id。
+
+    单租户模式下再过一道 is_own_tenant()：token 是别的租户的也返回 None，
+    容器只服务自己的租户。
+    """
     token = handler.headers.get("X-Tenant-Token", "")
     if token:
         tenant = verify_token(token)
-        if tenant:
+        if tenant and is_own_tenant(tenant):
             return tenant
     auth = handler.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
@@ -90,6 +106,6 @@ def get_tenant(handler) -> str | None:
     # gateway 在容器内网转发时会带这个头；agent-api 端口不对外发布，
     # 所以只有可信的网关能走到这里。本地调试时用 TRUST_TENANT_HEADER=1 开启。
     forwarded = handler.headers.get("X-Tenant-Id", "")
-    if forwarded and TENANT_RE.match(forwarded):
+    if forwarded and TENANT_RE.fullmatch(forwarded) and is_own_tenant(forwarded):
         return forwarded if TRUST_TENANT_HEADER else None
     return None

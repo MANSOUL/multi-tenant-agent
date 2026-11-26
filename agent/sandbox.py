@@ -3,9 +3,15 @@
 两种模式（环境变量 SANDBOX_MODE）：
   docker：docker run --rm --read-only --network none --cpus 0.5 --memory 256m，
           只挂载该租户的工作区（读写），用完即销毁。需要宿主机有 Docker，
-          且 agent-api 容器挂载了 /var/run/docker.sock。
+          且 agent 容器挂载了 /var/run/docker.sock。
   local ：开发回退。没有 Docker 时在 agent 本地跑白名单命令（仍限工作区，
           但和 agent 同进程、未隔离），输出会明确标注，仅开发调试用。
+
+一租户一容器后，租户数据在命名卷里（SANDBOX_VOLUME，如 mt-data-demo），
+卷在宿主机上没有“/app/data/…”这样的路径，所以沙箱容器不能再挂宿主机
+路径；这时改成直接挂卷 `-v <卷名>:/data`，工作目录是卷内
+`/data/<租户>/workspace`。没设 SANDBOX_VOLUME 时走老路：直接挂 workspace
+的宿主机路径（共享 agent-api 时用 ./data 绑定挂载，那时路径在宿主机上存在）。
 
 注意：沙箱镜像（如 python:3.12-slim）里不一定有 git，git status 在沙箱里
 跑不通时会返回命令自身的报错，这是预期行为，不是 bug。
@@ -13,9 +19,27 @@
 import os
 import shutil
 import subprocess
+from pathlib import Path
 
 SANDBOX_MODE = os.environ.get("SANDBOX_MODE", "docker")
 SANDBOX_IMAGE = os.environ.get("SANDBOX_IMAGE", "python:3.12-slim")
+# 一租户一容器时网关传入，如 mt-data-demo；为空表示老模式（挂宿主机路径）。
+SANDBOX_VOLUME = os.environ.get("SANDBOX_VOLUME", "").strip()
+TENANT_ID = os.environ.get("TENANT_ID", "").strip()
+
+
+def _sandbox_mount(workspace: str) -> tuple[list, str]:
+    """沙箱容器的挂载参数和工作目录。
+
+    有 SANDBOX_VOLUME 时挂卷（卷内路径 /data/<租户>/workspace）；
+    否则挂 workspace 的宿主机路径（老模式，./data 绑定挂载时才有效）。
+    返回 (docker -v/-w 参数列表, 工作目录)。
+    """
+    if SANDBOX_VOLUME:
+        tenant = TENANT_ID or Path(workspace).parent.parent.name
+        workdir = f"/data/{tenant}/workspace"
+        return ["-v", f"{SANDBOX_VOLUME}:/data:rw", "-w", workdir], workdir
+    return ["-v", f"{workspace}:/workspace:rw", "-w", "/workspace"], "/workspace"
 
 # 白名单：只读命令，不用 shell=True 解析，管道/重定向/分号都进不来。
 # rm 等危险命令不在这里，永远跑不了。
@@ -50,6 +74,7 @@ def run_command(command: str, workspace: str) -> tuple[str, str]:
     if SANDBOX_MODE == "docker" and _docker_available():
         # 每会话一个短命容器：只读根文件系统、无网络、禁 privileged、
         # CPU 0.5 核 / 内存 256MB 上限，只挂该租户的工作区。
+        mount_args, _workdir = _sandbox_mount(workspace)
         docker_cmd = [
             "docker", "run", "--rm",
             "--read-only",
@@ -57,8 +82,7 @@ def run_command(command: str, workspace: str) -> tuple[str, str]:
             "--cpus", "0.5",
             "--memory", "256m",
             "--cap-drop", "ALL",
-            "-v", f"{workspace}:/workspace:rw",
-            "-w", "/workspace",
+        ] + mount_args + [
             SANDBOX_IMAGE,
         ] + argv
         try:

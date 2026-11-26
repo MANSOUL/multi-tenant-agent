@@ -1,3 +1,13 @@
+# 一租户一容器（2026-11-26 重构）：compose 只起常驻服务，
+# 租户 agent 容器（mt-tenant-<租户>）由网关按需 docker run / start，
+# 不在 compose 里写死。
+#
+# 常驻服务：
+#   gateway  — 唯一对外端口 8080；登录 + 管租户容器 + 反向代理
+#   browser  — 共享浏览器服务（先保留，后续可按租户拆，见下面注释）
+#   postgres / redis — 可选（profiles: optional），当前 agent 默认不用
+#
+# 租户镜像不在这里起：先 build（见 README 快速开始），网关再用它起容器。
 services:
   gateway:
     build: ./gateway
@@ -7,37 +17,31 @@ services:
       - .env
     environment:
       - PORT=8080
-      - AGENT_API_URL=http://agent-api:8081
+      # 租户容器配置（默认值见 .env.example，改 .env 就行）
+      - DOCKER_NETWORK=${DOCKER_NETWORK:-multi-tenant-agent_default}
+      - AGENT_IMAGE=${AGENT_IMAGE:-multi-tenant-agent-agent-api:latest}
+      - TENANT_CPU=${TENANT_CPU:-0.5}
+      - TENANT_MEMORY=${TENANT_MEMORY:-512m}
+      - TENANT_IDLE_MINUTES=${TENANT_IDLE_MINUTES:-30}
     ports:
       # 唯一对外端口，只放局域网，不要映射到公网
       - "8080:8080"
-    depends_on:
-      - agent-api
-
-  agent-api:
-    build: .
-    container_name: mt-agent-api
-    restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      - PORT=8081
-      - DATA_DIR=/data
-      # browser 服务在容器内网的地址
-      - BROWSER_URL=http://browser:8001
-      - SANDBOX_MODE=docker
-      - SANDBOX_IMAGE=python:3.12-slim
-    # 不发布 8081：只允许 gateway 在容器内网访问
-    expose:
-      - "8081"
     volumes:
-      # 每租户数据：data/<tenant>/workspace、memory.db、browser-profile
-      - ./data:/data
-      # 沙箱需要用宿主机 Docker 起每会话容器（docker-out-of-docker）
-      # 高权限点：只在自己可信的单机上用，见 README 安全提醒
+      # 网关要调宿主机 Docker 起/停租户容器，必须挂 docker.sock。
+      # 高权限点：拿到这个 sock 就等于拿到宿主机 root，
+      # 只在自己可信的单机上用，见 README 安全提醒。
       - /var/run/docker.sock:/var/run/docker.sock:ro
     depends_on:
       - browser
+
+  # 构建租户镜像用（不常驻、不自动起）：
+  #   docker compose --profile build build agent-image
+  # 或直接：docker build -t multi-tenant-agent-agent-api:latest .
+  # 镜像必须先存在，网关 docker run 时不会自动 build。
+  agent-image:
+    build: .
+    image: multi-tenant-agent-agent-api:latest
+    profiles: ["build"]
 
   browser:
     build: ./browser
@@ -49,17 +53,23 @@ services:
     expose:
       - "8001"
     volumes:
-      # 截图写到各租户工作区：data/<tenant>/workspace/browser-*.png
+      # 共享浏览器先保留：所有租户共用这一个 Chromium 服务。
+      # 已知限制：租户数据现在各在自己的命名卷里，共享 browser 容器
+      # 看不到租户卷，所以截图写不到租户卷里，会落在宿主机 ./data 下；
+      # 后续要么给每个租户起一个 browser 容器，要么按需把租户卷挂进
+      # browser。浏览取标题/正文不受影响。
       - ./data:/data
     # Chromium 在容器里跑需要共享内存，不然容易崩
     shm_size: 1gb
 
-  # 可选服务：当前版本 agent-api 默认用每租户 SQLite，不依赖它俩。
+  # 可选服务：当前版本 agent 默认用每租户 SQLite，不依赖它俩。
   # 留给以后做共享元数据（postgres）/ 限流缓存（redis）时用。
+  # 默认不启动，需要时：docker compose --profile optional up -d
   postgres:
     image: postgres:16-alpine
     container_name: mt-postgres
     restart: unless-stopped
+    profiles: ["optional"]
     env_file:
       - .env
     environment:
@@ -74,6 +84,7 @@ services:
     image: redis:7-alpine
     container_name: mt-redis
     restart: unless-stopped
+    profiles: ["optional"]
     volumes:
       - redisdata:/data
     # 不发布端口：只在容器内网用
@@ -81,3 +92,5 @@ services:
 volumes:
   pgdata:
   redisdata:
+  # 租户数据卷（mt-data-<租户>）由网关 docker run 时自动创建，
+  # 不用在这里逐个声明；docker volume ls 能看到，删卷 = 删该租户全部数据。

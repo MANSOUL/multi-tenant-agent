@@ -4,14 +4,24 @@
 环境变量：LLM_BASE_URL / LLM_API_KEY / LLM_MODEL / MAX_TOOL_ROUNDS /
   CONTEXT_MAX_TURNS / CONTEXT_MAX_CHARS / SUMMARY_THRESHOLD_TURNS /
   PORT / DATA_DIR / TOKEN_SECRET（与网关的 GATEWAY_SECRET 相同）/
-  BROWSER_URL / SANDBOX_MODE / SANDBOX_IMAGE / TRUST_TENANT_HEADER
+  BROWSER_URL / SANDBOX_MODE / SANDBOX_IMAGE / SANDBOX_VOLUME /
+  TRUST_TENANT_HEADER / TENANT_ID
 依赖：见 agent/requirements.txt（langgraph / langchain-core / langchain-openai）
+
+一租户一容器（2026-11-26 重构）：每个租户单独一个 agent 容器，
+启动时由网关传入 TENANT_ID 和 DATA_DIR=/app/data，数据在该租户的
+专属 Docker volume 里。容器只服务 TENANT_ID 这一个租户，见 tenant.py
+的 is_own_tenant() / get_tenant() 校验。
 """
 import os
 from pathlib import Path
 
 PORT = int(os.environ.get("PORT", "8081"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
+# 单租户模式：网关起租户容器时传入 TENANT_ID=租户 id；为空表示老模式
+# （一个进程服务多租户，本地调试用），容器只认 TENANT_ID 这一个租户。
+TENANT_ID = os.environ.get("TENANT_ID", "").strip()
+SINGLE_TENANT_MODE = bool(TENANT_ID)
 BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 API_KEY = os.environ.get("LLM_API_KEY", "")
 MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")

@@ -1,35 +1,43 @@
 # 多租户 Agent · 单机 + Docker 原型
 
 > 由 `~/workspace/pi-agent-starter/`（单租户）改来，2026-11-26 建。
-> 目标：单机 + Docker 上每个租户一台隔离的“虚拟电脑”（先用每会话一个容器实现，
-> 以后可换成 Firecracker 微虚拟机 / 完整 KVM 虚拟机，见下文“隔离路线图”）。
+> 目标：单机 + Docker 上每个租户一台隔离的“虚拟电脑”。
+> **2026-11-26 重构：一租户一容器**——每个租户单独一个 agent 容器
+> （`mt-tenant-<租户>`），数据在该租户的专属 Docker volume
+> （`mt-data-<租户>`）里；以前是所有租户共用一个 agent-api 容器、
+> 只靠 `tenant_id` 做逻辑隔离，那版已废弃，见下文“架构”和 VERIFY.md。
+> 以后可再换成 Firecracker 微虚拟机 / 完整 KVM 虚拟机，见“隔离路线图”。
 > 现有 starter 完全没动，这个项目是独立的新目录。
 
 ## 项目结构
 
 ```
 multi-tenant-agent/
-├── docker-compose.yml      # 5 个服务：gateway / agent-api / browser / postgres / redis
-├── Dockerfile              # agent-api 镜像：装 agent/requirements.txt，CMD python3 agent/app.py
-├── .env.example
-├── agent/                  # agent-api（Python 包，可 python3 agent/app.py 或 python -m agent.app 启动）
+├── docker-compose.yml      # 常驻服务：gateway / browser / postgres·redis（可选）
+│                           # 租户 agent 容器不在 compose 里，由网关按需 docker run
+├── Dockerfile              # 租户 agent 镜像：装 agent/requirements.txt，CMD python3 agent/app.py
+├── .env.example            # 含 TENANT_CPU / TENANT_MEMORY / TENANT_IDLE_MINUTES /
+│                           # DOCKER_NETWORK / AGENT_IMAGE 等租户容器配置
+├── agent/                  # agent（Python 包，可 python3 agent/app.py 或 python -m agent.app 启动）
 │   ├── app.py              # 薄入口：只转发到 server.main()（20 行）
-│   ├── config.py           # 环境变量和常量（PORT/DATA_DIR/LLM_*/CONTEXT_*/TOKEN_SECRET/提示词）
-│   ├── tenant.py           # 租户隔离：tenant_dirs / tenant_db / safe_path / token 校验
+│   ├── config.py           # 环境变量和常量（PORT/DATA_DIR/LLM_*/CONTEXT_*/TOKEN_SECRET/
+│   │                       # TENANT_ID / 提示词）
+│   ├── tenant.py           # 租户校验：tenant_dirs / tenant_db / safe_path / token 校验 /
+│   │                       # is_own_tenant（单租户容器只认自己的租户）
 │   ├── memory.py           # 记忆与上下文：facts/chat_log/summaries、load_context、摘要/截断
 │   ├── tools.py            # 10 个工具：make_tools(tenant)，浏览器实现 browse_page_impl
 │   ├── graph.py            # LangGraph 图：AgentState、build_graph、chat()
 │   ├── server.py           # HTTP 服务：页面 + /api/health、/api/chat、/api/me
-│   ├── sandbox.py          # 每会话沙箱：docker 模式 / local 回退
+│   ├── sandbox.py          # 每会话沙箱：docker 模式 / local 回退（docker 模式支持挂卷）
 │   └── requirements.txt    # langgraph / langchain-core / langchain-openai
-├── gateway/                # 网关：登录 + 发 token + 反向代理
-└── browser/                # 浏览器服务：Playwright Chromium
+├── gateway/                # 网关：登录 + 发 token + 租户容器管理 + 反向代理
+└── browser/                # 浏览器服务：Playwright Chromium（所有租户先共用一个）
 ```
 
 各模块只通过明确的 import 单向依赖：`server → graph → tools/memory → tenant → config`，
 `sandbox` 只被 `tools` 调。隔离逻辑只有 `tenant.py` 一份，工具和记忆都不各自重复实现。
 
-## 架构（文字图）
+## 架构（文字图）——一租户一容器
 
 ```
                     ┌──────────────────────────────────────────────┐
@@ -39,15 +47,17 @@ multi-tenant-agent/
                                 ▼
                     ┌───────────────────────┐
                     │  gateway 网关 (8080)   │  登录 → 发 token（HMAC 签名）
-                    │  演示账号密码，见 .env  │  每个请求带上 X-Tenant-Id
+                    │  演示账号密码，见 .env  │  按租户管容器：run / start /
+                    │  挂 docker.sock        │  stop（闲置回收），见下节
                     └───────────┬───────────┘
-                                │  内网 only（agent-api 不对外发布端口）
+                                │  内网 only（租户容器不对外发布端口）
                                 ▼
               ┌─────────────────────────────────┐
-              │  agent-api (8081，容器内)       │
-              │  LangGraph 图：recall → llm →    │
+              │  mt-tenant-demo (8081，容器内)  │  ← 每个租户一个
+              │  mt-tenant-tenant-a (8081)      │  ← 容器名就是 DNS 名
+              │  LangGraph 图：recall → llm →    │     网关按名代理过去
               │  tools 循环（见下节）            │
-              │  记忆：每租户一个 SQLite         │
+              │  记忆：本容器专属卷里的 SQLite   │
               │  命令：每会话一个沙箱容器        │
               └──────┬──────────────┬───────────┘
                      │              │
@@ -56,18 +66,65 @@ multi-tenant-agent/
    沙箱容器          browser 服务   postgres / redis（可选）
    每会话一个        Playwright     postgres：以后做共享元数据
    用完即销毁        Chromium       redis：以后做限流/缓存
-   (docker run)      开网页/截图     —— 当前版本 agent 默认用
-                     返回标题/正文   每租户 SQLite，不依赖它俩
+   (docker run，      开网页/截图     —— 当前版本 agent 默认用
+    直接挂租户卷)     返回标题/正文   每租户 SQLite，不依赖它俩
 ```
 
-数据隔离（每一步都按 `tenant_id` 分）：
+数据隔离（进程级 + 卷级，不再只靠 `tenant_id` 分）：
 
 | 东西 | 位置 | 说明 |
 |---|---|---|
-| 工作区文件 | `data/<tenant>/workspace/` | 只能读写自己的目录，`..` 穿越会被挡掉 |
-| 记忆 | `data/<tenant>/memory.db` | 每租户一个 SQLite，`facts` / `chat_log` / `summaries` 三张表，不跨租户查 |
-| 浏览器 profile | `data/<tenant>/browser-profile/` | 每租户独立，Cookie/登录态不串 |
-| 浏览器截图 | `data/<tenant>/workspace/browser-*.png` | 由 browser 服务写到共享卷 |
+| 租户容器 | `mt-tenant-<租户>` | 一个租户一个进程/容器，挂了也不影响别的租户；容器只认自己的租户（`TENANT_ID` 校验，见 `agent/tenant.py` 的 `is_own_tenant()`） |
+| 工作区文件 | 卷 `mt-data-<租户>` 内的 `<租户>/workspace/` | 只能读写自己的目录，`..` 穿越会被挡掉；卷在宿主机上由 Docker 管理，容器删了数据还在 |
+| 记忆 | 同卷内的 `<租户>/memory.db` | 每租户一个 SQLite，`facts` / `chat_log` / `summaries` 三张表，物理上就不在别的容器里 |
+| 浏览器 profile | 同卷内的 `<租户>/browser-profile/` | 每租户独立，Cookie/登录态不串 |
+| 浏览器截图 | 共享 browser 服务写到宿主机 `./data`（已知限制） | 租户卷共享 browser 容器看不到，截图暂时落不到租户卷里，见“各服务” |
+
+### 租户容器生命周期（网关管，不用手工起）
+
+```
+首次登录 / 聊天
+  → 网关 docker inspect mt-tenant-<租户>
+      ├─ 不存在 → docker run -d --name mt-tenant-<租户> --network <DOCKER_NETWORK>
+      │           --cpus <TENANT_CPU> --memory <TENANT_MEMORY>
+      │           -v mt-data-<租户>:/app/data -e TENANT_ID=<租户> -e LLM_*=…
+      │           <AGENT_IMAGE>
+      ├─ 已停止 → docker start mt-tenant-<租户>
+      └─ 在跑   → 直接用
+  → 轮询 http://mt-tenant-<租户>:8081/api/health 直到通（最多 60 秒）
+  → 代理请求到该容器，成功后更新最后活跃时间
+闲置回收（网关后台线程，每 60 秒检查一次）
+  → 最后活跃超过 TENANT_IDLE_MINUTES（默认 30 分钟）→ docker stop
+  → 只停不停删：volume 保留，下次登录/聊天时再 docker start，数据都在
+手动管理（调试用）：
+  docker ps --filter name=mt-tenant-        # 看哪些租户容器在跑
+  docker volume ls | grep mt-data-          # 看各租户的数据卷
+  docker stop mt-tenant-demo                 # 手工停一个租户（网关下次会再起）
+  docker rm mt-tenant-demo                   # 删容器（数据在卷里，还在）
+  docker volume rm mt-data-demo              # ⚠️ 删卷 = 删该租户全部数据，别手滑
+```
+
+### 资源估算
+
+| 项 | 开销 | 说明 |
+|---|---|---|
+| 镜像 | 共享一层 | 所有租户容器都用同一个 `AGENT_IMAGE`，镜像只存一份（约 300MB 级，含 langgraph 依赖）；浏览器镜像另算，约 1GB+，也是所有租户共用一个服务 |
+| 每个活跃租户容器 | 约 512MB 内存上限（`TENANT_MEMORY`，可调）+ 0.5 核（`TENANT_CPU`） | Python + LangGraph 进程本身常驻约 100–200MB，跑工具/调模型时再涨，512m 是上限不是常驻占用；不活跃会被回收停掉，不占内存 |
+| 每个租户数据卷 | 按实际用量 | SQLite + 工作区文件，刚开始只有几十 KB |
+| 2 核 / 3.5G 内存的服务器（当前部署机） | 约 4–6 个同时活跃的租户 | 3.5G 减去系统 + 网关 + 浏览器（Chromium 约 500MB–1GB）后，剩约 2–2.5G 给租户容器；租户多了就排队等回收，或调小 `TENANT_MEMORY`、调短 `TENANT_IDLE_MINUTES` |
+| 100 个租户 | 不等于 100 个容器同时跑 | 注册 100 个、同时在线 4–6 个是常态；闲置回收就是干这个的 |
+
+### 从老模型迁移（共享 agent-api → 一租户一容器）
+
+老模型的数据在宿主机 `./data/<租户>/` 下，新模型各租户在自己的卷里。
+迁移某个租户的数据（以 `demo` 为例，停掉旧服务后跑一次）：
+
+```bash
+docker run --rm -v mt-data-demo:/to -v ./data/demo:/from alpine sh -c 'cp -r /from/. /to/'
+# 之后 demo 登录时网关起的容器就能看到原来的记忆和工作区文件
+```
+
+不迁移也行：新租户第一次登录时网关会自动建空卷，从零开始。
 
 ## LangGraph 图怎么跑（2026-11-26 改成 LangGraph 之后）
 
@@ -157,10 +214,16 @@ cd multi-tenant-agent
 cp .env.example .env
 nano .env        # 1) 填 LLM_API_KEY（任何 OpenAI 兼容接口）
                  # 2) 改 GATEWAY_SECRET 和 GATEWAY_USERS 的密码（演示账号！）
+                 # 3) 按机器调 TENANT_CPU / TENANT_MEMORY / TENANT_IDLE_MINUTES
+# 先 build 租户镜像（网关 docker run 时不会自动 build，镜像必须先存在）：
+docker compose --profile build build agent-image
+# 再起常驻服务（网关 + 共享浏览器；postgres/redis 默认不起）：
 docker compose up -d --build
 # 打开 http://<宿主机IP>:8080 ，用 .env 里 GATEWAY_USERS 的账号登录
+# 首次登录会等几秒等网关起你的租户容器（mt-tenant-<你>）
 # 试试：df / 记住：我喜欢喝美式 / 帮我打开 https://example.com 看看标题是什么
-docker compose down        # 停掉；data/ 会保留各租户的工作区和记忆
+docker compose down        # 停掉常驻服务；租户容器和卷不受影响，
+                           # 下次登录时网关会把你的容器再 start 起来
 ```
 
 没有 Docker 的机器上也可以先跑通聊天逻辑（见 `VERIFY.md`），但要先装依赖：
@@ -168,33 +231,35 @@ docker compose down        # 停掉；data/ 会保留各租户的工作区和记
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r agent/requirements.txt
 cp .env.example .env   # LLM_API_KEY 先留空也能起服务，聊天时会提示缺 key
-PORT=8081 DATA_DIR=./data .venv/bin/python agent/app.py
+# 单租户容器模式等价于：TENANT_ID=demo PORT=8081 DATA_DIR=./data
+PORT=8081 DATA_DIR=./data TENANT_ID=demo .venv/bin/python agent/app.py
 ```
 
 ## 各服务
 
 | 服务 | 镜像/构建 | 端口 | 说明 |
 |---|---|---|---|
-| gateway | `gateway/Dockerfile`（python:3.12-slim，标准库） | 8080（唯一对外端口） | 登录 + 发 token + 反向代理到 agent-api |
-| agent-api | 根目录 `Dockerfile`（python:3.12-slim，装 `agent/requirements.txt`：langgraph 等） | 8081（仅容器内网） | LangGraph 图编排、工具、记忆、沙箱、调浏览器服务 |
-| browser | `browser/Dockerfile`（Playwright Python 镜像） | 8001（仅容器内网） | Chromium 无头浏览：打开页面、取标题/正文、截图 |
-| postgres | `postgres:16-alpine` | 不发布 | 可选。当前版本 agent 不依赖它，留给以后做共享元数据/计量 |
-| redis | `redis:7-alpine` | 不发布 | 可选。当前版本 agent 不依赖它，留给以后做限流/缓存 |
+| gateway | `gateway/Dockerfile`（python:3.12-slim，标准库 + docker CLI） | 8080（唯一对外端口） | 登录 + 发 token + 租户容器管理（run/start/stop/闲置回收）+ 按租户反向代理 |
+| mt-tenant-\<租户\> | 根目录 `Dockerfile`（python:3.12-slim，装 `agent/requirements.txt`：langgraph 等） | 8081（仅容器内网，不对外发布） | 每个租户一个：LangGraph 图编排、工具、记忆、沙箱、调浏览器服务；数据在卷 `mt-data-<租户>` 里；由网关按需起停，不在 compose 里 |
+| browser | `browser/Dockerfile`（Playwright Python 镜像） | 8001（仅容器内网） | Chromium 无头浏览：打开页面、取标题/正文、截图；**所有租户先共用一个**，后续可按租户拆（截图落盘问题见架构图下的表） |
+| postgres | `postgres:16-alpine` | 不发布 | 可选（`--profile optional` 才起）。当前版本 agent 不依赖它，留给以后做共享元数据/计量 |
+| redis | `redis:7-alpine` | 不发布 | 可选（`--profile optional` 才起）。当前版本 agent 不依赖它，留给以后做限流/缓存 |
 
 ## 隔离路线图（按这个顺序升级，每步都能单独验证）
 
 | 阶段 | 隔离 | 状态 |
 |---|---|---|
-| 1. 容器沙箱（本项目） | 每会话一个 `docker run --rm` 容器：`--read-only` 根文件系统、禁 `--privileged`、无网络（`--network none`）、CPU 0.5 核 / 内存 256MB 上限，只挂载该租户的工作区 | 已实现；宿主机必须有 Docker 且 agent-api 挂了 `/var/run/docker.sock` |
-| 2. 回退模式 | 宿主机没有 Docker 时，命令在 agent-api 本地跑白名单命令（仍限工作区内），输出会明确标注“本地回退：未隔离，仅开发用” | 已实现，仅用于开发调试 |
-| 3. Firecracker 微虚拟机 | 把第 1 步的 `docker run` 换成微虚拟机启动，其他层不动 | 未实现，待定（需要宿主机有 `/dev/kvm`，见下文待讨论问题） |
+| 0. 一租户一容器（本项目，2026-11-26 重构） | 每个租户一个常驻 agent 容器 + 专属数据卷，进程和数据物理隔离；闲置 30 分钟自动停 | 已实现（代码）；`docker compose up`、真实容器启动/路由/回收还没跑过，见 VERIFY.md |
+| 1. 容器沙箱 | 每会话一个 `docker run --rm` 容器：`--read-only` 根文件系统、禁 `--privileged`、无网络（`--network none`）、CPU 0.5 核 / 内存 256MB 上限，只挂载该租户的工作区（租户容器里改成直接挂卷，见 `agent/sandbox.py`） | 已实现；宿主机必须有 Docker 且 agent 容器挂了 `/var/run/docker.sock` |
+| 2. 回退模式 | 宿主机没有 Docker 时，命令在 agent 本地跑白名单命令（仍限工作区内），输出会明确标注“本地回退：未隔离，仅开发用” | 已实现，仅用于开发调试 |
+| 3. Firecracker 微虚拟机 | 把第 0 步的租户容器换成微虚拟机启动，其他层不动 | 未实现，待定（需要宿主机有 `/dev/kvm`，见下文待讨论问题） |
 | 4. 完整 KVM 虚拟机 | 每租户一台常驻虚拟机 | 未实现，只在租户少、隔离要求最高时用 |
 
-### 容量参考（来自 `pi-agent-starter/MULTI_TENANT_VM_PLAN.md`）
+### 容量参考（来自 `pi-agent-starter/MULTI_TENANT_VM_PLAN.md`，已按本项目实测口径更新）
 
-| 层次 | 每租户额外开销 | 单机 32GB / 8 核大概能同时跑 |
+| 层次 | 每租户额外开销 | 单机大概能同时跑 |
 |---|---|---|
-| Docker 容器 | 约 50–100MB 内存 | 几十个轻度租户 |
+| Docker 容器（本项目） | 约 512MB 内存上限 + 0.5 核（LangGraph 进程常驻约 100–200MB） | 2 核 / 3.5G 的机器约 4–6 个活跃租户；32GB / 8 核约几十个轻度租户 |
 | Firecracker 微虚拟机 | 约几 MB–几十 MB + 应用内存 | 几十个，按需启动可更多 |
 | 完整 KVM 虚拟机 | 至少 1 核 / 2GB 内存 / 20GB 磁盘 | 约 10 台左右 |
 
@@ -207,12 +272,21 @@ PORT=8081 DATA_DIR=./data .venv/bin/python agent/app.py
 - **不要把 8080 暴露到公网**，只在局域网用；想在外面用，先走自己的 VPN / 内网穿透。
 - `.env` 只放占位符和你自己的 key，**不要提交、不要发给别人**；`.gitignore` 已覆盖 `.env` 和 `data/`。
 - LLM API Key 只通过环境变量 `LLM_API_KEY` 传入，代码里没有任何真实 key。
+  注意：网关起租户容器时会把 `LLM_API_KEY` 等以 `docker run -e` 传进去，
+  key 会短暂出现在宿主机的进程列表里，和其他任何 `docker run -e` 传 key 的做法一样，
+  只能在自己可信的单机上用。
 - 沙箱容器禁 privileged、只读根文件系统、无网络；但容器共用宿主机内核，理论上仍存在容器逃逸风险，
   隔离强度低于 Firecracker / 完整虚拟机，做不到 Muse 同级。
 - 浏览器服务跑的是无头 Chromium：能开网页、登录、截图、抓正文；但网站可能检测无头浏览器而弹验证码，
   视频/音频/DRM 支持差。需要“用户直接看画面操作”时，要再加 Xvfb + noVNC，本项目暂未做。
-- `agent-api` 挂载了宿主机的 `/var/run/docker.sock` 才能起沙箱容器——这本身就是一个高权限点，
-  只能在自己可信的单机上用，不要把这个 compose 文件原样搬到共享宿主机上。
+- **docker.sock 是最大的高权限点**：网关挂了宿主机的 `/var/run/docker.sock`
+  才能起/停租户容器，每个租户容器也挂了它才能起每会话沙箱容器——
+  拿到这个 sock 就等于拿到宿主机 root。只能在自己可信的单机上用，
+  不要把这个 compose 文件原样搬到共享宿主机上；生产要换成 Docker API
+  代理（如 socket-proxy）做权限收紧，或把沙箱改成不用宿主机 Docker 的方案。
+- 租户容器之间是进程隔离，但共用宿主机内核；一个租户容器被攻破后，
+  理论上仍可能通过 docker.sock / 内核漏洞影响宿主机和其他租户，
+  这是容器方案的固有上限，不是本项目的 bug。
 
 ## 待讨论的问题（下次细聊时定）
 
@@ -228,7 +302,10 @@ PORT=8081 DATA_DIR=./data .venv/bin/python agent/app.py
 
 ## 验证情况
 
-见 `VERIFY.md`：2026-11-26 改成 LangGraph 后，在本机 venv 里实测通过图编译、
-租户隔离、stub 模型端到端循环和网关联调；但这台 VM 上没有 Docker，
-所以 `docker compose up`、沙箱 docker 模式、浏览器运行时和真实 LLM 对话都没跑过，
-第一次在有 Docker 的机器上跑时按 VERIFY.md 逐项验。
+见 `VERIFY.md` 顶部（2026-11-26 一租户一容器重构）：本地只验证了
+py_compile、容器名/路由/闲置回收的纯函数逻辑和 fake docker 的 ensure
+调用序列；这台 VM 上没有 Docker，所以 `docker compose up`、真实租户容器
+的创建/启动/路由/回收、沙箱挂卷模式都没跑过，第一次在有 Docker 的机器上
+部署时按 VERIFY.md 逐项验——先 `docker compose --profile build build
+agent-image`，再 `docker compose up -d`，登录 `demo` 看 `mt-tenant-demo`
+是否起来、`/api/health` 是否通、30 分钟不用是否自动停。

@@ -1,4 +1,86 @@
-## 2026-11-26 项目结构重构之后（新）
+## 2026-11-26 一租户一容器重构之后（新）
+
+重构内容：共享 agent-api 拆成一租户一容器。改了 `gateway/gateway.py`
+（租户容器管理：ensure/run/start/健康轮询/闲置回收 + 按租户代理）、
+`gateway/Dockerfile`（装 docker CLI）、`docker-compose.yml`（去掉共享
+agent-api，gateway 挂 docker.sock，browser 保留共享，postgres/redis 改成
+`profiles: optional`，新增 `agent-image` 构建服务）、`agent/config.py`
+（`TENANT_ID` / `SINGLE_TENANT_MODE`）、`agent/tenant.py`
+（`is_own_tenant()`，单租户容器只认自己的租户）、`agent/graph.py`
+（`chat()` 开头挡非本租户）、`agent/server.py`（`/api/health` 返回
+`tenant` / `single_tenant`）、`agent/sandbox.py`（`SANDBOX_VOLUME`
+时沙箱直接挂卷）、`.env.example`（新增 `TENANT_CPU` / `TENANT_MEMORY` /
+`TENANT_IDLE_MINUTES` / `DOCKER_NETWORK` / `AGENT_IMAGE`）、`README.md`
+（新架构图、生命周期、资源估算、迁移说明）。`pi-agent-starter/` 没动。
+
+- `python3 -m py_compile agent/*.py gateway/gateway.py browser/browser.py`：
+  全部通过。
+- `docker-compose.yml` 用 PyYAML 解析通过：服务为 gateway / agent-image
+  （profile build）/ browser / postgres / redis（profile optional）；
+  共享 agent-api 已不在；gateway 挂了 docker.sock、环境变量含
+  `DOCKER_NETWORK` / `AGENT_IMAGE` / `TENANT_*`。
+- Stub 测试（`/tmp/test_per_tenant.py`，不调真实 Docker/LLM，用 fake
+  docker + monkeypatch；数据在 `/tmp/mt-per-tenant-data`，没碰项目 `data/`），
+  **全部通过**：
+  - (a) 容器名/卷名/路由：`demo` → 容器 `mt-tenant-demo`、卷 `mt-data-demo`、
+    代理目标 `http://mt-tenant-demo:8081`；`tenant-a` 同理；
+  - (b) 租户 id 校验：`demo` / `tenant-a` / `user_1` 通过；`../demo`、
+    `a b`、`demo;rm -rf /`、`demo$(id)`、空串、65 个字符均被拒；
+  - (c) ensure 调用序列（fake docker）：容器 missing → 调 `docker run`
+    创建（argv 含 `--name mt-tenant-demo`、`--network`、`--cpus 0.5`、
+    `--memory 512m`、`-v mt-data-demo:/app/data`、`-e TENANT_ID=demo`、
+    `-e SANDBOX_VOLUME=mt-data-demo`、镜像名，且不含 shell 注入字符）；
+    容器 stopped → 只调 `docker start`，不重复 run；容器 running →
+    不调 run/start，直接等健康检查；
+  - (d) 健康轮询：前两次不通、第三次通 → ensure 返回成功；
+    一直不通 → 超时抛错；
+  - (e) 闲置回收：最后活跃 31 分钟前、阈值 30 分钟 → 该停；
+    10 分钟前 → 不停；`reap_idle` 只停超时的租户容器（`docker stop`
+    收到一次），不停删，volume 保留；
+  - (f) agent 端单租户校验：`TENANT_ID=demo` 时 `is_own_tenant("demo")`
+    为真、`is_own_tenant("tenant-a")` 为假；`get_tenant` 拿 tenant-a 的
+    token 时返回 None；`chat()` 对非本租户抛错；
+  - (g) 沙箱挂卷：`SANDBOX_VOLUME=mt-data-demo` 时沙箱挂载为
+    `-v mt-data-demo:/data:rw`、工作目录 `/data/demo/workspace`；
+    没设时仍挂宿主机 workspace 路径。
+- HTTP 实测（本机起真服务，无 Docker、无真实 key）：
+  - 网关 `GET /` → 200 登录页；`POST /api/login`（demo/demo123）→
+    502“租户容器启动失败：docker 命令执行失败（本机没装 docker）”，
+    说明登录→ensure 的链路已接通，失败时报错清晰、网关不崩。
+  - agent（`TENANT_ID=demo`）`GET /api/health` →
+    `{"ok": true, "tenant": "demo", "single_tenant": true, ...}`；
+    `/api/me` 带 demo 的 token → 200 `{"tenant": "demo"}`，
+    带 tenant-a 的 token → 401。单租户校验在 HTTP 层也生效。
+    测试用的 `GATEWAY_SECRET=test-secret` 只在测试进程的环境变量里，
+    没写进任何文件；测完两个服务都已停掉，无残留进程。
+- 无硬编码密钥：grep 检查过 py 文件和 compose（`.env.example` 里只有
+  占位符和演示账号密码）。
+
+## 未验证（一租户一容器重构后，必须在有 Docker 的机器上跑）
+
+- **`docker compose up` / `docker compose --profile build build agent-image`：
+  本机无 Docker，根本没跑过。** 首次部署必须先 build 租户镜像再起网关，
+  否则网关 `docker run` 会报镜像不存在。
+- **真实租户容器的创建/启动/路由/回收：都没跑过。** 包括：首次登录
+  `demo` 是否真的起了 `mt-tenant-demo`、`/api/health` 是否通、聊天
+  是否走到该容器、30 分钟不用是否真的 `docker stop`、再登录是否
+  `docker start` 恢复且数据还在（卷里）、两个租户同时在线是否各走
+  各的容器、租户容器里 `TENANT_ID` 校验是否挡得住错发的请求。
+- **沙箱挂卷模式没跑过**：`SANDBOX_VOLUME` 下沙箱 `docker run -v
+  mt-data-demo:/data` 是否真能读写到租户卷里的工作区、git/df 等白名单
+  命令是否通；没跑过之前，沙箱 docker 模式按未验证处理。
+- **网关的 docker CLI 没跑过**：gateway 镜像里 `apt-get install docker.io`
+  是否装得上、网关容器里 `docker` 命令是否真能连上宿主机 Docker、
+  `DOCKER_NETWORK` 默认值 `multi-tenant-agent_default` 是否和实际
+  compose 网络名一致（用 `-p` 改过项目名时必须改 `.env`）。
+- **浏览器截图落盘问题没验证**：共享 browser 容器看不到租户卷，
+  截图是否如 README 所说落在宿主机 `./data` 而不是租户卷里，
+  以及是否影响 `browse_page` 返回的路径，首次部署时要实测一次。
+- **资源估算没实测**：2 核 3.5G 上 4–6 个活跃租户、每租户 512m
+  上限只是按进程常驻内存估算的，没有在该配置上同时起多个租户容器压过。
+- **真实 LLM 端到端对话**：同前，stub 没调真实接口，填 key 后再验。
+
+## 2026-11-26 项目结构重构之后（上一版记录，保留）
 
 - `agent/app.py` 从约 700 行拆成 7 个模块 + 1 个薄入口（见 README“项目结构”）：
   `config.py`（配置）/`tenant.py`（租户隔离）/`memory.py`（记忆与上下文）/
