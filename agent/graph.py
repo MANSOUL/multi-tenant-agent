@@ -6,8 +6,10 @@ facts / chat_log / summaries / todos / reminders /
 pending_notifications 表（见 memory.py）。
 接地确认（2026-11-26）：凡是用户说记住/保存/提醒我/待办，必须调相应工具，
 只有工具返回成功后才能说“已记下/已设好”并回显内容和时间；没调工具不许认。
+改提醒时间必须调 update_reminder，改完把工具返回的时间跟用户要的时间核对
+一遍，对不上换写法再试一次，两次都对不上才如实说没改成功，绝不编解释。
 此外 save_memory 里还有一道确定性自动落盘（extract_explicit），就算模型
-没调工具，显式指令也会被写进 facts/todos/reminders 表。
+没调工具，显式指令也会被写进 facts/todos/reminders 表（歧义时间的不写）。
 """
 from datetime import datetime, timezone
 from typing import Annotated, TypedDict
@@ -127,7 +129,9 @@ def build_graph(tenant: str):
         对用户消息跑确定性自动落盘（extract_explicit），把显式指令写进
         facts/todos/reminders 表——就算模型没调工具，指令也不会丢。
         抽取本身静默失败（不报错、不阻塞）；最后把本轮拼进系统提示的
-        待送达提醒标记为已送达（delivered=1），下次不再重复提醒。"""
+        待送达提醒标记为已送达（delivered=1），同时把对应的提醒行从 due
+        翻成 notified——不翻的话，提醒行会一直留在提醒列表里，模型每轮
+        都看到、每轮都再说一遍（Bug 4 实测：第二轮聊天又出现一次）。"""
         user_text, ai_text = "", ""
         for msg in state["messages"]:
             if isinstance(msg, HumanMessage) and isinstance(msg.content, str):

@@ -3,6 +3,8 @@
 pending_notifications 三张表。
 
 顺序：待送达提醒 → 摘要 → 最近若干轮原文 → 长期事实 → 待办/提醒 → 模型。
+提醒行状态：pending（未到点）→ due（已到点，等送达）→ notified（已当面
+提醒过，不再出现）；每天重复的到点后另起一行次日的 pending。
 自动落盘：save_memory 每轮对用户消息跑 extract_explicit()，把显式指令
 直接写进 facts / todos / reminders，不依赖模型调工具；失败时静默跳过。
 load_context 只读本租户的库，绝不跨租户；轮数超阈值时把最旧的轮
@@ -63,26 +65,82 @@ _CN_NUM = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
            "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12}
 
 
+def _cn_int(s: str):
+    """中文数字转 int，支持 0–59：“五”→5、“十”→10、“十三”→13、
+    “二十五”→25、“零五”→5、“三十”→30。不是数字返回 None。"""
+    s = (s or "").strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    if "十" in s:
+        head, _, tail = s.partition("十")
+        tens = _CN_NUM.get(head, 1) if head else 1
+        if tens is None:
+            return None
+        total = tens * 10
+        if tail:
+            ones = _cn_int(tail)
+            if ones is None:
+                return None
+            total += ones
+        return total
+    total = 0
+    for ch in s:
+        if ch not in _CN_NUM:
+            return None
+        total = total * 10 + _CN_NUM[ch]
+    return total
+
+
 def _parse_hour(text: str):
-    """从“8点”“八点”“8点半”“8:30”“20点”里取 (小时, 分钟)，取不到返回 None。"""
+    """从时间词里取 (小时, 分钟)，取不到返回 None。
+    支持：“8点”“八点”“8点半”(=30分)、“八点一刻”(=15分)、
+    “三刻”(=45分)、“七点二十分”(=20分)、“7点20分”“7点20”、
+    “8:30”“19:20”。
+    Bug 1 的根因（2026-11-26 实测）：旧版只认“半”一种分钟写法，
+    “二十分/一刻/20分”全被丢掉，所以“七点二十分”存成了 19:00。
+    """
     text = (text or "").strip()
     m = re.search(r"(\d{1,2})[:：](\d{1,2})", text)
     if m:
-        return int(m.group(1)), int(m.group(2))
+        hour, minute = int(m.group(1)), int(m.group(2))
+        return (hour, minute) if 0 <= hour <= 23 and 0 <= minute <= 59 else None
     m = re.search(r"([零一二三四五六七八九十]{1,3}|[0-9]{1,2})\s*[点時时]", text)
     if not m:
         return None
-    raw = m.group(1)
-    if raw.isdigit():
-        hour = int(raw)
+    hour = _cn_int(m.group(1))
+    if hour is None or not 0 <= hour <= 23:
+        return None
+    rest = text[m.end():]
+    minute = 0
+    mm = re.match(r"\s*(半|一刻|三刻|二刻)", rest)
+    if mm:
+        minute = {"半": 30, "一刻": 15, "三刻": 45, "二刻": 30}[mm.group(1)]
     else:
-        hour = _CN_NUM.get(raw)
-        if hour is None:  # “十三点”这类组合数字不在表里，按位拼
-            hour = 0
-            for ch in raw:
-                hour = hour * 10 + _CN_NUM.get(ch, 0)
-    minute = 30 if "半" in text[m.end():m.end() + 1] else 0
+        mm = re.match(
+            r"\s*([零一二三四五六七八九十]{1,3}|[0-9]{1,2})\s*分?", rest)
+        if mm:
+            minute = _cn_int(mm.group(1))
+            if minute is None or minute > 59:
+                return None
     return hour, minute
+
+
+def due_day_label(due_at_iso, now=None) -> str:
+    """due_at 是今天/明天/哪天：返回“今天”/“明天”/“11月28日”，解析失败返回“”。"""
+    try:
+        due = datetime.fromisoformat(due_at_iso)
+    except (TypeError, ValueError):
+        return ""
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=reminder_tz())
+    delta = (due.date() - _now_in_tz(now).date()).days
+    if delta == 0:
+        return "今天"
+    if delta == 1:
+        return "明天"
+    return due.strftime("%m月%d日")
 
 
 def parse_reminder_time(text: str, now=None) -> dict:
@@ -92,6 +150,8 @@ def parse_reminder_time(text: str, now=None) -> dict:
 
     支持：早上/上午 8 点→08:00，晚上/下午 8 点→20:00，中午 12 点→12:00，
     “明天早上 8 点”，“每天早上 8 点”→repeat=daily，“8点半”“8:30”。
+    分钟（2026-11-26 修 Bug 1）：七点二十分→:20、7点20分/7点20→:20、
+    8:30→:30、八点半→:30、八点一刻→:15、三刻→:45，解析不到分钟时分钟为 0。
     裸“8点”（没有早上/上午/中午/下午/晚上/凌晨）不猜上下午，
     返回 ambiguous=True、due_at=None。
     没解析出时间时 due_at=None、ambiguous=False。
@@ -192,13 +252,17 @@ def extract_explicit(text: str, tenant: str, now=None) -> dict:
 
     匹配的指令：
     - “记住…/记住：…”→ facts；“别忘了…”→ facts
-    - “提醒我…/…点提醒我…/每天…点提醒我…”→ reminders（时间能解析就
-      算 due_at；裸“8点”歧义时 due_at 留空，等用户补上下午）
+    - “提醒我…/…点提醒我…/每天…点提醒我…”→ reminders（只有时间解析出
+      due_at 才写；裸“8点”歧义或根本没时间时不落盘，记到
+      result["ambiguous_reminders"] 里，由模型当场追问——Bug 5 的根因就是
+      旧版把歧义提醒以 due_at=None 写进表里，模型回头就当成已设好）
     - “待办…/待办事项：…”→ todos（按 、，；分多条）
-    返回 {"facts": n, "todos": n, "reminders": n}；任何异常都静默吞掉，
+    返回 {"facts": n, "todos": n, "reminders": n,
+          "ambiguous_reminders": [提醒内容...]}；任何异常都静默吞掉，
     返回全 0，绝不阻塞聊天。调用方（graph.save_memory）也要包 try。
     """
-    result = {"facts": 0, "todos": 0, "reminders": 0}
+    result = {"facts": 0, "todos": 0, "reminders": 0,
+              "ambiguous_reminders": []}
     try:
         text = (text or "").strip()
         if not text:
@@ -219,29 +283,38 @@ def extract_explicit(text: str, tenant: str, now=None) -> dict:
                 for item in re.split(r"[、，,；;]", m.group(1)):
                     if _add_todo_row(conn, item):
                         result["todos"] += 1
-            # 提醒：先找“X点提醒我做Y”，再找“提醒我X”。
-            m = re.search(r"(.+?[点時时](?:半)?(?:\s*[:：]?\s*)?)提醒我(.+)$", text)
+            # 提醒：时间可能在“提醒我”前面（“七点二十分提醒我喝水”、
+            # “每天早上8点提醒我喝水”），也可能在后面（“提醒我明天早上8点喝水”）。
+            # 两种都走同一份 parse_reminder_time，不各写一份。
+            # 旧版 Bug 1 在这里也有一份：第一条正则只认“点”后跟“半”，
+            # “七点二十分提醒我…”根本匹配不上，时间就丢了。
+            m = re.search(r"提醒我(.+)$", text)
             if m:
-                time_part, what = m.group(1), m.group(2)
-                parsed = parse_reminder_time(time_part, now=now)
-                if _add_reminder_row(conn, _clean_reminder_text(what), parsed):
-                    result["reminders"] += 1
-            else:
-                m = re.search(r"提醒我(.+)$", text)
-                if m:
-                    body = m.group(1).strip()
+                before = text[:m.start()].strip()
+                body = m.group(1).strip()
+                what = body
+                parsed = (parse_reminder_time(before, now=now) if before
+                          else {"due_at": None, "repeat": "once",
+                                "ambiguous": False, "text": before})
+                if not parsed.get("due_at") and not parsed.get("ambiguous"):
+                    # “提醒我”前面没时间，时间在后面：解析 body 并去掉时间词，
+                    # 如“早上8点喝水”→“喝水”、“明天晚上7点20分开会”→“开会”。
                     parsed = parse_reminder_time(body, now=now)
-                    what = body
-                    if parsed.get("due_at") or parsed.get("ambiguous"):
-                        # 把时间词从内容里去掉，如“早上8点喝水”→“喝水”
-                        what = re.sub(
-                            r"^(每天|每日|明天|明日)?(凌晨|早上|上午|中午|下午|晚上)?"
-                            r"[零一二三四五六七八九十0-9]{1,3}\s*[点時时](半)?"
-                            r"([:：]\d{1,2})?[，, ]*", "", body)
-                    if _add_reminder_row(conn, _clean_reminder_text(what), parsed):
+                    what = re.sub(
+                        r"^(每天|每日|明天|明日)?(凌晨|早上|上午|中午|下午|晚上)?"
+                        r"[零一二三四五六七八九十0-9]{1,3}\s*[点時时]"
+                        r"(半|一刻|三刻|二刻|[零一二三四五六七八九十]{1,3}分"
+                        r"|[0-9]{1,2}分?|[:：][0-9]{1,2})?"
+                        r"[，, ]*", "", body)
+                what = _clean_reminder_text(what)
+                if parsed.get("ambiguous"):
+                    result["ambiguous_reminders"].append(what)
+                elif parsed.get("due_at"):
+                    if _add_reminder_row(conn, what, parsed):
                         result["reminders"] += 1
     except Exception:
-        return {"facts": 0, "todos": 0, "reminders": 0}
+        return {"facts": 0, "todos": 0, "reminders": 0,
+                "ambiguous_reminders": []}
     return result
 
 
@@ -295,16 +368,30 @@ def check_due_reminders(tenant: str, now=None) -> list:
 
 
 def mark_notifications_delivered(tenant: str, notification_ids) -> None:
-    """把指定 id 的待提醒标记为已送达（delivered=1），下次不再出现。"""
+    """把指定 id 的待提醒标记为已送达（delivered=1），下次不再出现。
+    同时把对应的提醒行从 due 翻成 notified——Bug 4 的真正根因：
+    旧版只标了通知，已送达的提醒行还留在 status='due'，而 load_context
+    的提醒列表会把 status='due' 的行一直列出来，模型每轮看到就再说一遍，
+    所以第二轮聊天又出现一次。翻成 notified 后它就从提醒列表里消失，
+    list_reminders 工具里仍能看到（算历史）。"""
     ids = [i for i in (notification_ids or []) if isinstance(i, int)]
     if not ids:
         return
     try:
         with tenant_db(tenant) as conn:
+            rows = conn.execute(
+                f"SELECT text, due_at FROM pending_notifications WHERE"
+                f" tenant = ? AND id IN ({','.join('?' * len(ids))})",
+                [tenant, *ids]).fetchall()
             conn.execute(
                 f"UPDATE pending_notifications SET delivered = 1 WHERE"
                 f" tenant = ? AND id IN ({','.join('?' * len(ids))})",
                 [tenant, *ids])
+            for rtext, due_at in rows:
+                conn.execute(
+                    "UPDATE reminders SET status = 'notified'"
+                    " WHERE text = ? AND due_at = ? AND status = 'due'",
+                    (rtext, due_at))
     except Exception:
         pass
 
@@ -389,6 +476,9 @@ def load_context(tenant: str, llm=None, max_turns=None, max_chars=None,
         summary = row[0] if row else ""
         # 待办与提醒（2026-11-26）：只读 pending 的；待送达的 due 提醒
         # 只读 delivered=0 的，拼进 system prompt 后由 save_memory 标记已送达。
+        # 提醒列表只列 pending 的——已到点的提醒只走【待提醒】这一条路，
+        # 送达后行状态翻成 notified，不再列出（Bug 4：旧版把 due 的行也列在
+        # 这里，模型每轮都看到、每轮都再说一遍）。
         todos = "\n".join(
             f"- [{tid}] {t}" for tid, t in conn.execute(
                 "SELECT id, text FROM todos WHERE status = 'pending'"
@@ -398,7 +488,7 @@ def load_context(tenant: str, llm=None, max_turns=None, max_chars=None,
             f"{'每天' if r == 'daily' else '一次'}，{s}）"
             for rid, t, d, r, s in conn.execute(
                 "SELECT id, text, due_at, repeat, status FROM reminders"
-                " WHERE status IN ('pending', 'due') ORDER BY id ASC"
+                " WHERE status = 'pending' ORDER BY id ASC"
             ).fetchall())
         due_notifications = [
             {"id": nid, "text": t, "due_at": d}

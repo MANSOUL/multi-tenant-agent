@@ -1,4 +1,4 @@
-"""工具：给一个租户建一套 LangChain 工具（共 15 个）。
+"""工具：给一个租户建一套 LangChain 工具（共 16 个）。
 
 每个工具函数都闭包了 tenant，内部只走 tenant.py 的隔离函数
 （tenant_dirs / tenant_db / safe_path）和 sandbox.py 的 run_command，
@@ -15,11 +15,15 @@ from urllib.error import HTTPError, URLError
 
 try:
     from .config import BROWSER_URL
-    from .memory import _add_reminder_row, _add_todo_row, parse_reminder_time
+    from .memory import (
+        _add_reminder_row, _add_todo_row, due_day_label, parse_reminder_time,
+    )
     from .tenant import safe_path, tenant_db, tenant_dirs
 except ImportError:  # 以脚本方式运行 python3 agent/app.py 时
     from config import BROWSER_URL
-    from memory import _add_reminder_row, _add_todo_row, parse_reminder_time
+    from memory import (
+        _add_reminder_row, _add_todo_row, due_day_label, parse_reminder_time,
+    )
     from tenant import safe_path, tenant_db, tenant_dirs
 
 from langchain_core.tools import tool
@@ -210,28 +214,78 @@ def make_tools(tenant: str):
 
     @tool
     def add_reminder(text: str, time_text: str = "", repeat: str = "once") -> str:
-        """给本租户设一个提醒。text 是要做的事（如“喝水”），time_text 是时间
-        （如“早上8点”“明天晚上8点”“每天早上8点”）；repeat 为 "daily" 时每天重复。
-        成功返回里含内容和时间，供模型回显；裸“8点”没说上下午时返回追问，
-        提醒先记下（时间未定），等用户补齐时间再算。"""
+        """给本租户设一个提醒。text 是要做的事（如“开会”，只是格式示例），time_text 是时间
+        （如“早上8点”“晚上7点20分”“19:20”“每天早上8点”）；repeat 为 "daily" 时每天重复。
+        成功返回里含内容和完整时间（今天/明天），供模型回显和核对。
+        裸“8点”没说上下午时不落盘，只返回追问；没解析出时间时也不落盘。
+        （Bug 5 的根因：旧版先写了 due_at 为空的行再追问，模型回头就当成已设好。）"""
         parsed = parse_reminder_time(time_text or text)
         if repeat == "daily":
             parsed["repeat"] = "daily"
+        if parsed.get("ambiguous"):
+            return (f"“{time_text or text}”没说早上还是晚上，这条提醒还没存。"
+                    f"请只问用户一次：早上还是晚上？问到答案后立刻用完整时间"
+                    f"（如“晚上8点”）再调一次 add_reminder。不要说已经设好了。")
+        if not parsed.get("due_at"):
+            return (f"“{time_text or text}”里没解析出时间，这条提醒还没存。"
+                    f"请问用户具体几点（比如“早上8点”或“19:20”）。")
         with tenant_db(tenant) as conn:
             _add_reminder_row(conn, text.strip(), parsed)
+        when = parsed["due_at"].replace("T", " ").split("+")[0]
+        return (f"已设好提醒：{text.strip()}，时间 {when}"
+                f"（{due_day_label(parsed['due_at'])}，"
+                f"{'每天' if parsed['repeat'] == 'daily' else '一次'}）")
+
+    @tool
+    def update_reminder(reminder_id: int = 0, text: str = "",
+                         new_time_text: str = "") -> str:
+        """把本租户的一条提醒改到新时间。优先按 id（list_reminders 里看到的编号）；
+        id 为 0 时按 text 匹配最近一条未完成/未到点的提醒。
+        改提醒直接执行，不许先问“确认一下吗”。返回里含改完的新时间，
+        调用方必须拿它跟用户要的时间核对一遍（见系统提示的核对规则）。
+        裸“8点”没说上下午时不改，只返回追问。"""
+        parsed = parse_reminder_time(new_time_text or "")
         if parsed.get("ambiguous"):
-            return (f"已记下提醒：{text.strip()}，但“{time_text or text}”没说"
-                    f"是早上还是晚上，请告诉我是早上还是晚上，我再把时间定下来。")
-        if parsed.get("due_at"):
-            when = parsed["due_at"].replace("T", " ").split("+")[0]
-            return (f"已设好提醒：{text.strip()}，时间 {when}"
-                    f"（{'每天' if parsed['repeat'] == 'daily' else '一次'}）")
-        return (f"已记下提醒：{text.strip()}，但没解析出时间，"
-                f"请告诉我具体几点（比如“早上8点”）。")
+            return (f"“{new_time_text}”没说早上还是晚上，这条提醒还没改。"
+                    f"请只问用户一次：早上还是晚上？问到答案后立刻用完整时间再调一次。")
+        if not parsed.get("due_at"):
+            return (f"“{new_time_text}”里没解析出时间，这条提醒还没改。"
+                    f"请问用户具体几点（比如“晚上7点20分”或“19:20”）。")
+        with tenant_db(tenant) as conn:
+            row = None
+            if reminder_id:
+                row = conn.execute(
+                    "SELECT id, text FROM reminders WHERE id = ?"
+                    " AND status IN ('pending', 'due')",
+                    (reminder_id,)).fetchone()
+            if row is None and text.strip():
+                row = conn.execute(
+                    "SELECT id, text FROM reminders WHERE text = ?"
+                    " AND status IN ('pending', 'due')"
+                    " ORDER BY id DESC LIMIT 1",
+                    (text.strip(),)).fetchone()
+            if row is None:
+                return "没有找到要改的那条提醒，请先用 list_reminders 查一下编号。"
+            rid, old_text = row
+            conn.execute(
+                "UPDATE reminders SET due_at = ?, repeat = ?,"
+                " status = 'pending' WHERE id = ?",
+                (parsed["due_at"], parsed.get("repeat", "once"), rid))
+            # 这条提醒之前到点产生的未送达通知作废，避免旧时间再冒出来。
+            conn.execute(
+                "UPDATE pending_notifications SET delivered = 1"
+                " WHERE tenant = ? AND text = ? AND delivered = 0",
+                (tenant, old_text))
+        when = parsed["due_at"].replace("T", " ").split("+")[0]
+        return (f"已把提醒「{old_text}」改成 {when}"
+                f"（{due_day_label(parsed['due_at'])}，"
+                f"{'每天' if parsed['repeat'] == 'daily' else '一次'}）")
 
     @tool
     def list_reminders() -> str:
-        """列出本租户的提醒（未到点的和已到点的都在内）。"""
+        """列出本租户的提醒（未到点的、已到点的、已提醒过的都在内）。"""
+        status_label = {"pending": "待提醒", "due": "已到点",
+                        "notified": "已提醒", "done": "已完成"}
         with tenant_db(tenant) as conn:
             rows = conn.execute(
                 "SELECT id, text, due_at, repeat, status FROM reminders"
@@ -242,9 +296,11 @@ def make_tools(tenant: str):
         for i, t, d, r, s in rows:
             when = (d or "时间未定，需确认上下午").replace("T", " ").split("+")[0]
             lines.append(
-                f"[{s} {i}] {t}，{when}，{'每天' if r == 'daily' else '一次'}")
+                f"[{status_label.get(s, s)} {i}] {t}，{when}，"
+                f"{'每天' if r == 'daily' else '一次'}")
         return "\n".join(lines)
 
     return [run_command, read_file, write_file, list_workspace, search_file,
             remember_fact, recall_fact, search_facts, list_facts, browse_page,
-            add_todo, list_todos, complete_todo, add_reminder, list_reminders]
+            add_todo, list_todos, complete_todo, add_reminder, update_reminder,
+            list_reminders]

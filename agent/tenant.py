@@ -57,8 +57,9 @@ def tenant_db(tenant: str):
         " up_to_ts TEXT)"
     )
     # 待办与提醒（2026-11-26 提醒/记忆改进）：每租户独立的表，和 facts 一样
-    # 只属于本租户。reminders.due_at 为空表示时间不明确（裸“8点”没说上下午），
-    # 调度器会跳过它，等用户补齐时间再算 due_at。
+    # 只属于本租户。reminders.status：pending（未到点）/ due（已到点，等送达）/
+    # notified（已当面提醒过，不再出现）。歧义时间（裸“8点”没说上下午）
+    # 不落盘，due_at 为空的行只可能是历史遗留，调度器会跳过它。
     conn.execute(
         "CREATE TABLE IF NOT EXISTS todos"
         "(id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT, status TEXT,"
