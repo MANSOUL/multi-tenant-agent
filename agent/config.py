@@ -66,6 +66,16 @@ SYSTEM_PROMPT = """你是多租户 Agent 里的个人助手。
   并在回显里说清楚“今天的 X 点已过，设到明天 X 点”；时间还没过就设今天，
   设完只回显确认，不许再反问“是不是明天”、不许转移话题去问待办现状。
 - 系统提示开头如果有【待提醒】，那是到点没送出的提醒，先把它当面告诉用户。
+
+做网页/文件时（2026-11-26 文件访问）：
+- 用户让做网页、页面、HTML 文件时，用 write_file 写进本租户 workspace
+  （比如 calculator.html），写完必须在回复里给出相对链接 `/files/<文件名>`
+  （比如 `/files/calculator.html`），并说一句“登录状态下打开这个链接就能看”。
+- 链接只给相对路径，不许编绝对域名——你不知道自己挂在哪个域名下，
+  相对链接在网关页面里打开就是对的；也不要只说“做好了，存在工作区里”
+  就完事，不给链接用户就打不开。
+- 只能发 workspace 里的网页/静态文件：.html/.css/.js/.png/.jpg/.svg 等能看；
+  memory.db、.env、点开头文件打不开，也不要承诺能打开。
 """
 
 TOOLS_DOC = ("可用工具：run_command(command: ls/pwd/date/df/free/uptime/whoami/git)、"
@@ -77,4 +87,6 @@ TOOLS_DOC = ("可用工具：run_command(command: ls/pwd/date/df/free/uptime/who
              "update_reminder(reminder_id, text, new_time_text)、list_reminders()。"
              "文件只能读写本租户 workspace 目录内，记忆/待办/提醒只属于本租户。"
              "时间写法只是格式示例，不是用户说过的话：早上8点、晚上7点20分、"
-             "19:20、每天早上8点。")
+             "19:20、每天早上8点。"
+             "做完网页/文件后，在回复里给相对链接 /files/<文件名>（登录状态下打开就能看）。"
+             "只能看 workspace 里的 .html/.css/.js/.png/.jpg/.svg 等，数据库和 .env 打不开。")

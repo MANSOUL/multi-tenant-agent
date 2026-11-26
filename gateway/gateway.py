@@ -11,9 +11,13 @@
      存在 cookie 里，同时返回给前端。登录时会把该租户的容器 ensure 起来
      （不存在就 docker run 创建，停了就 docker start，起来后等
      /api/health 通了再返回）。
-  3. 之后所有 /api/* 请求，网关先校验 token，再 ensure 该租户的容器，
+  3. 之后所有 /api/* 和 /files/* 请求，网关先校验 token，再 ensure 该租户的容器，
      校验通过才反向代理到 http://mt-tenant-<租户>:8081，并在转发时带上
      X-Tenant-Id 和 X-Tenant-Token。校验不过直接 401，不会透传。
+     /files/* 是租户工作区里的网页/静态文件（agent 的 /files/ 接口），
+     浏览器直接打开时不带 Authorization 头，靠登录时种的 mt_token cookie
+     认身份（token_from() 会读 cookie）；上游的 Content-Type 原样透传，
+     不许给 html/图片套 json 头。
   4. 闲置回收：后台线程每 60 秒检查一次，租户容器最后活跃超过
      TENANT_IDLE_MINUTES（默认 30 分钟）就 docker stop（不停删，
      volume 保留，下次登录/聊天时再 docker start）。
@@ -293,6 +297,8 @@ form{display:flex;gap:8px;margin-top:12px}
 <p><button onclick="logout()">退出登录</button></p></div>
 <script>
 let token='';
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function linkify(s){return esc(s).replace(/(https?:[/][/][^\s<>"'，。；：、）】]+|[/]files[/][^\s<>"'，。；：、）】]+)/g,'<a href="$1" target="_blank" rel="noopener">$1</a>');}
 async function login(){
  const u=document.getElementById('u').value.trim();
  const p=document.getElementById('p').value;
@@ -306,10 +312,10 @@ async function login(){
 async function send(e){e.preventDefault();
  const q=document.getElementById('q'); const t=q.value.trim(); if(!t) return; q.value='';
  const log=document.getElementById('log');
- log.innerHTML+=`<div class="me">你：${t}</div>`; log.scrollTop=log.scrollHeight;
+ log.innerHTML+=`<div class="me">你：${esc(t)}</div>`; log.scrollTop=log.scrollHeight;
  const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({message:t})});
  const d=await r.json();
- log.innerHTML+=`<div class="ai">助手：${d.reply||d.error||'出错了'}</div>`; log.scrollTop=log.scrollHeight;}
+ log.innerHTML+=`<div class="ai">助手：${linkify(d.reply||d.error||'出错了')}</div>`; log.scrollTop=log.scrollHeight;}
 function logout(){document.cookie='mt_token=; path=/; max-age=0';location.reload();}
 </script></body></html>"""
 
@@ -338,7 +344,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             return self._send(200, LOGIN_PAGE)
-        if self.path.startswith("/api/"):
+        if self.path.startswith("/api/") or self.path.startswith("/files/"):
             return self._proxy()
         return self._send(404, "not found", "text/plain")
 
@@ -399,13 +405,18 @@ class Handler(BaseHTTPRequestHandler):
             with urllib.request.urlopen(req, timeout=90) as resp:
                 data = resp.read()
                 touch(tenant)
-                return self._send(resp.status, data,
-                                  resp.headers.get_content_type()
-                                  + "; charset=utf-8")
+                # 上游的 Content-Type 原样透传：/files/ 的 html 按 text/html、
+                # 图片按 image/*，绝不能像以前那样一律套上 json 头
+                # （以前是 get_content_type() + "; charset=utf-8"，图片也会被
+                # 标成带 charset 的类型，浏览器可能不认）。
+                ctype = resp.headers.get("Content-Type") or \
+                    "application/octet-stream"
+                return self._send(resp.status, data, ctype)
         except HTTPError as e:
             touch(tenant)
-            return self._send(e.code, e.read(),
-                              e.headers.get_content_type() + "; charset=utf-8")
+            ctype = e.headers.get("Content-Type") or \
+                "application/octet-stream"
+            return self._send(e.code, e.read(), ctype)
         except Exception as e:  # noqa: BLE001 - 代理失败时把原因告诉前端
             return self._send(502, json.dumps(
                 {"error": f"连不上租户容器 {container_name(tenant)}：{e}"},

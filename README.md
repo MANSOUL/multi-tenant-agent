@@ -265,6 +265,33 @@ START → recall_memory → llm → tools → llm → save_memory → END
 | 记忆 | `facts` 表 | `facts` 表 + 新增 `chat_log` 表（save_memory 节点写） |
 | 鉴权 / 隔离 / 沙箱 / 浏览器 | — | 一点没变，见 VERIFY.md 的复测记录 |
 
+## 做好的网页怎么打开（2026-11-26 文件访问）
+
+背景：之前用户让 agent 做了个网页 `calculator.html`，文件确实写进了
+demo 租户的工作区，但用户在浏览器里打不开——agent 和网关都没有返回
+文件的接口，文件只躺在容器卷里，没有任何地址能访问它。
+
+现在的做法：
+
+- **打开方式**：先在网关登录（http://\<宿主机\>:8080），登录状态下直接
+  打开 `http://<宿主机>:8080/files/<文件名>`，比如
+  `http://<宿主机>:8080/files/calculator.html`。浏览器靠登录时种的
+  `mt_token` cookie 认身份，不用再贴 token。
+- **agent 会直接给链接**：让它做网页/页面/HTML 文件时，它写进 workspace
+  后，回复里必须给出相对链接 `/files/<文件名>`，聊天页会把它渲染成可点击
+  的链接，点开就是做好的页面。
+- **只能看自己租户工作区里的文件**：`/files/` 先验 token 再进本租户
+  workspace，别的租户的文件打不开；`..` 穿越、绝对路径、符号链接逃逸
+  一律 403；不存在的文件 404，目录不列表。
+- **支持的后缀**：.html / .css / .js / .png / .jpg / .jpeg / .gif / .svg /
+  .webp / .json / .txt / .md，按后缀返回正确的 Content-Type，图片按字节
+  原样发。`.db` / `.sqlite` / `.env`、点开头文件一律打不开（403）——
+  记忆库和 key 不会从这个口子漏出去。
+- **实现位置**：`agent/server.py` 的 `_serve_file()`（鉴权 + `safe_path`
+  锁目录 + 后缀白名单 + 按字节读），`gateway/gateway.py` 的 `do_GET`
+  把 `/files/` 交给现有的 `_proxy()`，并原样透传上游 Content-Type
+  （以前一律套 json 头，图片会被标错）。
+
 ## 快速开始
 
 ```bash

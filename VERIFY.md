@@ -1,3 +1,59 @@
+## 2026-11-26 文件访问功能：做好的网页能打开了（新）
+
+背景：用户让部署版 agent 做了个网页 calculator.html，文件确实写进了
+demo 租户工作区（/app/data/demo/workspace/calculator.html），但用户访问
+不到——agent server 和网关都没有返回文件的接口。
+
+改动（只改工作树，未提交、未推送、未部署）：
+- `agent/server.py`：新增 GET `/files/<相对路径>`（`_serve_file`），先过
+  `_need_tenant()` 鉴权（网关转发带 X-Tenant-Token），再用 `safe_path`
+  锁在本租户 workspace 内；`..`、绝对路径、符号链接逃逸、点开头文件、
+  .db/.sqlite/.env 和白名单外后缀一律 403，不存在/目录 404；按后缀显式
+  映射 Content-Type，二进制按字节读。do_GET 按 urlparse 的路径部分路由，
+  查询串只透传。聊天页 PAGE 的 JS 加 esc/linkify：回复里的 `/files/...`
+  和 http(s) 链接变成可点击的 `<a>`。
+- `gateway/gateway.py`：do_GET 增加 `/files/` 路由，走现有 `_proxy()`。
+  token_from() 本来就认登录时种的 mt_token cookie，所以浏览器直接打开
+  /files/calculator.html 不用再贴 Authorization 头，不用改。`_proxy()`
+  的 Content-Type 改为原样透传上游（以前是 get_content_type() +
+  "; charset=utf-8"，html/图片都会被套错头）。聊天页 LOGIN_PAGE 同样加
+  esc/linkify。
+- `agent/config.py`：SYSTEM_PROMPT 加做网页规则——写进 workspace 后回复
+  里必须给相对链接 `/files/<文件名>` 并说“登录状态下打开这个链接就能看”，
+  不许编绝对域名；TOOLS_DOC 同步。
+- `README.md`：新增“做好的网页怎么打开”一节（登录后打开 /files/<文件名>、
+  只能看自己租户的文件、支持的后缀、数据库和 .env 打不开）。
+
+已验证（本机，无 Docker、无真实 LLM key，只做 stub）：
+- `python3 -m py_compile agent/*.py gateway/gateway.py browser/browser.py`：全部通过。
+- 回归测试 `/tmp/test_files.py`（`~/workspace/tools/mtvenv/bin/python` 跑，
+  agent server 本地起在 127.0.0.1:18081，TENANT_ID=demo，数据在
+  /tmp/mt-files-data，没碰项目 `data/`，没联网装包，没写任何真实 key、
+  没创建 `.env`），**29 项全部通过，0 失败**：html 200 text/html 内容一致、
+  子目录 css 200、png 200 image/png 字节一致、带查询串仍 200、
+  `../memory.db` / 编码 `..` / 子目录 `..` 穿越 403、绝对路径
+  /etc/passwd（原样和编码）403、.env 403、符号链接逃逸到 memory.db 403、
+  不存在 404、目录 404、没 token 401、tenant-a 的 token 读 demo 文件 401、
+  假 token 401、workspace 内 .db 403；网关：token_from 认 mt_token cookie
+  和 Authorization、_proxy 透传到租户容器 8081 并转发 X-Tenant-Token、
+  text/html 和 image/png 的 Content-Type 原样透传（不套 json 头）、
+  do_GET 的 /files/ 和 /api/ 都走 _proxy、两处聊天页都有 linkify。
+  测试中修掉 1 个测试桩问题（fake handler 缺 requestline，send_response
+  记日志时报错；代码未动）和 1 个测试断言问题（页面源码里是 JS 转义的
+  `\/files\/`，断言按转义形式查；代码未动）。
+- 残留的 py_compile SyntaxWarning（PAGE/LOGIN_PAGE 里 JS 正则的 `\s`）：
+  只是 Python 对非 raw 字符串里 `\s` 的提示，值仍是反斜杠+s，JS 正则
+  行为正确，无害；之前 `\/` 的同类提示已用 `[/]` 写法消掉。
+
+未验证（必须在服务器上实测）：
+- 登录后浏览器打开 http://8.148.235.80:8080/files/calculator.html 是否
+  真的显示计算器（且 Content-Type 是 text/html）。
+- 登出后、换 tenant-a 账号登录后，是否打不开 demo 的 calculator.html。
+- 重新部署后要删掉旧的 `mt-tenant-<租户>` 容器，让网关按新镜像重建，
+  否则跑的还是旧代码（没有 /files/ 接口）。
+- 真实 DeepSeek 下，模型做完网页后是否按新提示在回复里给出
+  `/files/<文件名>` 相对链接。
+
 ## 2026-11-26 提醒功能 5 个实测 bug 修复（新）
 
 背景：用户拿原对话实测部署版 agent，5 处都翻车。

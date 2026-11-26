@@ -1,4 +1,7 @@
-"""HTTP 服务：聊天页面 + /api/health、/api/chat、/api/me。
+"""HTTP 服务：聊天页面 + /api/health、/api/chat、/api/me + /files/<路径>。
+
+/files/ 只发本租户 workspace 里的网页/静态文件（html/css/js/图片等），
+先过 _need_tenant() 鉴权，再用 safe_path 锁在 workspace 内，见 _serve_file。
 
 只负责 HTTP 层：鉴权（调 tenant.get_tenant）、把消息交给 graph.chat()、
 返回 JSON。业务逻辑（图、工具、记忆、沙箱）都在别的模块。
@@ -10,21 +13,23 @@
 聊天时提醒”，不要在任何地方假装能推送（见 README 能力边界）。
 """
 import json
+import mimetypes
 import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, urlparse
 
 try:
     from .config import DATA_DIR, MODEL, PORT, SINGLE_TENANT_MODE, TENANT_ID
     from .graph import chat
     from .memory import check_due_reminders
-    from .tenant import get_tenant
+    from .tenant import get_tenant, safe_path
 except ImportError:  # 以脚本方式运行 python3 agent/app.py 时
     from config import DATA_DIR, MODEL, PORT, SINGLE_TENANT_MODE, TENANT_ID
     from graph import chat
     from memory import check_due_reminders
-    from tenant import get_tenant
+    from tenant import get_tenant, safe_path
 
 
 def _reminder_tenants():
@@ -69,13 +74,15 @@ input{flex:1;padding:8px;font-size:16px}button{padding:8px 16px}
 <div id="log"></div>
 <form onsubmit="send(event)"><input id="q" autocomplete="off" placeholder="跟助手说点什么…"><button>发送</button></form>
 <script>
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function linkify(s){return esc(s).replace(/(https?:[/][/][^\s<>"'，。；：、）】]+|[/]files[/][^\s<>"'，。；：、）】]+)/g,'<a href="$1" target="_blank" rel="noopener">$1</a>');}
 async function send(e){e.preventDefault();
  const q=document.getElementById('q'); const t=q.value.trim(); if(!t) return; q.value='';
  const log=document.getElementById('log');
- log.innerHTML+=`<div class="me">你：${t}</div>`; log.scrollTop=log.scrollHeight;
+ log.innerHTML+=`<div class="me">你：${esc(t)}</div>`; log.scrollTop=log.scrollHeight;
  const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:t})});
  const d=await r.json();
- log.innerHTML+=`<div class="ai">助手：${d.reply||d.error||'出错了'}</div>`; log.scrollTop=log.scrollHeight;}
+ log.innerHTML+=`<div class="ai">助手：${linkify(d.reply||d.error||'出错了')}</div>`; log.scrollTop=log.scrollHeight;}
 </script></body></html>"""
 
 
@@ -99,22 +106,73 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return tenant
 
+    def _serve_file(self, tenant: str, rel: str):
+        """GET /files/<相对路径>：只发本租户 workspace 里的网页/静态文件。
+
+        鉴权在调用方（_need_tenant）；这里只管路径和后缀：
+        safe_path 会把 `..`、绝对路径、符号链接逃逸都挡在 workspace 内，
+        逃不出去的返回 403；点开头文件、.db/.sqlite/.env 和不在白名单的
+        后缀一律 403；不存在或是个目录就 404（目录不列表）。
+        二进制按字节读，Content-Type 按后缀显式映射，不猜错图片。
+        """
+        allowed = {
+            ".html": "text/html; charset=utf-8",
+            ".css": "text/css; charset=utf-8",
+            ".js": "text/javascript; charset=utf-8",
+            ".json": "application/json; charset=utf-8",
+            ".txt": "text/plain; charset=utf-8",
+            ".md": "text/markdown; charset=utf-8",
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".gif": "image/gif",
+            ".svg": "image/svg+xml",
+            ".webp": "image/webp",
+        }
+        rel = unquote(rel)
+        if rel.startswith("/"):
+            # /files//etc/passwd、/files/%2Fetc%2Fpasswd 这种绝对路径一律挡掉
+            return self._send(403, "forbidden", "text/plain")
+        if not rel or rel.endswith("/"):
+            return self._send(404, "not found", "text/plain")
+        try:
+            p = safe_path(tenant, rel)
+        except ValueError:
+            return self._send(403, "forbidden", "text/plain")
+        # safe_path 之后再按解析后的真实路径检查：workspace 里的符号链接
+        # 指到 memory.db 也会被后缀挡住；点开头文件（.env 等）一律不发。
+        if p.name.startswith(".") or p.suffix.lower() not in allowed:
+            return self._send(403, "forbidden", "text/plain")
+        if not p.is_file():
+            return self._send(404, "not found", "text/plain")
+        try:
+            data = p.read_bytes()
+        except OSError:
+            return self._send(404, "not found", "text/plain")
+        self._send(200, data, allowed[p.suffix.lower()])
+
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        # 查询串（?token= 之类）只用来透传，路由只看路径部分。
+        path = urlparse(self.path).path
+        if path in ("/", "/index.html"):
             self._send(200, PAGE)
-        elif self.path == "/api/health":
+        elif path == "/api/health":
             self._send(200, json.dumps(
                 {"ok": True, "model": MODEL, "engine": "langgraph",
                  "tenant": TENANT_ID or None,
                  "single_tenant": SINGLE_TENANT_MODE,
                  "sandbox_mode": os.environ.get(
                      "SANDBOX_MODE", "docker")}), "application/json")
-        elif self.path == "/api/me":
+        elif path == "/api/me":
             tenant = self._need_tenant()
             if tenant:
                 self._send(200, json.dumps({"tenant": tenant},
                                            ensure_ascii=False),
                            "application/json")
+        elif path.startswith("/files/"):
+            tenant = self._need_tenant()
+            if tenant:
+                self._serve_file(tenant, path[len("/files/"):])
         else:
             self._send(404, "not found", "text/plain")
 
