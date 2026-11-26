@@ -1,0 +1,83 @@
+services:
+  gateway:
+    build: ./gateway
+    container_name: mt-gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PORT=8080
+      - AGENT_API_URL=http://agent-api:8081
+    ports:
+      # 唯一对外端口，只放局域网，不要映射到公网
+      - "8080:8080"
+    depends_on:
+      - agent-api
+
+  agent-api:
+    build: .
+    container_name: mt-agent-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PORT=8081
+      - DATA_DIR=/data
+      # browser 服务在容器内网的地址
+      - BROWSER_URL=http://browser:8001
+      - SANDBOX_MODE=docker
+      - SANDBOX_IMAGE=python:3.12-slim
+    # 不发布 8081：只允许 gateway 在容器内网访问
+    expose:
+      - "8081"
+    volumes:
+      # 每租户数据：data/<tenant>/workspace、memory.db、browser-profile
+      - ./data:/data
+      # 沙箱需要用宿主机 Docker 起每会话容器（docker-out-of-docker）
+      # 高权限点：只在自己可信的单机上用，见 README 安全提醒
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - browser
+
+  browser:
+    build: ./browser
+    container_name: mt-browser
+    restart: unless-stopped
+    environment:
+      - PORT=8001
+      - DATA_DIR=/data
+    expose:
+      - "8001"
+    volumes:
+      # 截图写到各租户工作区：data/<tenant>/workspace/browser-*.png
+      - ./data:/data
+    # Chromium 在容器里跑需要共享内存，不然容易崩
+    shm_size: 1gb
+
+  # 可选服务：当前版本 agent-api 默认用每租户 SQLite，不依赖它俩。
+  # 留给以后做共享元数据（postgres）/ 限流缓存（redis）时用。
+  postgres:
+    image: postgres:16-alpine
+    container_name: mt-postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-mt_agent}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-mt_agent}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # 不发布端口：只在容器内网用
+
+  redis:
+    image: redis:7-alpine
+    container_name: mt-redis
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+    # 不发布端口：只在容器内网用
+
+volumes:
+  pgdata:
+  redisdata:
