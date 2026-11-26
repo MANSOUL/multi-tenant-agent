@@ -1,3 +1,69 @@
+## 2026-11-26 提醒与记忆改进（新）
+
+背景：用户跟部署版 agent 说“8 点提醒我喝水”，它口头说“记下了”其实没写；
+再问“你记到哪里了”，答“记忆还是空的”；还说没法主动在 8 点提醒。
+
+改动（只改工作树，未提交、未推送、未部署）：
+- `agent/memory.py`：新增 `parse_reminder_time()`（早上/上午→08:00，
+  晚上/下午→20:00，明天/每天/8点半/8:30，裸“8点”返回歧义标志不猜）、
+  `extract_explicit()`（确定性抽取：记住/别忘了→facts 去重写，待办→todos，
+  提醒我/…点提醒我→reminders，失败静默跳过）、`check_due_reminders()`
+  （到点置 due + 写 pending_notifications，daily 自动生成次日提醒）、
+  `mark_notifications_delivered()`；`load_context()` 增加 todos / reminders /
+  due_notifications 三项返回；时区 `REMINDER_TZ`（默认 Asia/Shanghai，zoneinfo）。
+- `agent/tenant.py`：`tenant_db()` 新建 `todos` / `reminders` /
+  `pending_notifications` 三张表（每租户独立库）。
+- `agent/tools.py`：新增 5 个工具 `add_todo` / `list_todos` /
+  `complete_todo` / `add_reminder` / `list_reminders`（工具 10 个→15 个，
+  全部只读写本租户；成功返回含内容和时间；裸“8点”返回追问上下午）。
+- `agent/server.py`：启动时起提醒调度器守护线程（每 30 秒扫一次，
+  单租户容器只扫自己）；`start_reminder_scheduler()` 可调 interval 供测试。
+- `agent/graph.py`：`AgentState` 增加 todos / reminders / due_notifications；
+  `_system_prompt()` 把【待提醒】放最前面、再拼待办和提醒；`save_memory()`
+  每轮跑 `extract_explicit()` 自动落盘，并把本轮用过的待提醒标记已送达。
+- `agent/config.py`：`SYSTEM_PROMPT` 增加接地硬规则（记住/提醒/待办必须调
+  工具，工具成功后才能说“已记下/已设好”并回显；问“记到哪里了”必须先查
+  三张表列出来，三张表真空才能说空；裸“8点”必须追问上下午）；
+  `TOOLS_DOC` 增加 5 个新工具。
+- `README.md`：新增“提醒与记忆是怎么做的”一节，如实写清能力边界
+  （自动落盘、待办、到点后下次聊天时提醒、无手机推送、裸“8点”追问）。
+- `.env.example`：新增 `REMINDER_TZ=Asia/Shanghai`。
+
+已验证（本机，无 Docker、无真实 LLM key，只做 stub）：
+- `python3 -m py_compile agent/*.py gateway/gateway.py browser/browser.py`：全部通过。
+- Stub 测试 `/tmp/test_reminders.py`（`~/workspace/tools/mtvenv/bin/python` 跑，
+  数据在 `/tmp/mt-reminder-data`，每次运行先清空，没碰项目 `data/`，没联网装包，
+  没写任何真实 key、没创建 `.env`），**37 项全部通过，0 失败**：
+  - 时间解析 10 项：早上/上午 8 点→08:00，晚上 8 点→20:00，下午 3 点→15:00，
+    裸“8点”歧义且 due_at 为空，明天早上 8 点→次日 08:00，每天早上 8 点→
+    repeat=daily，早上 8 点半→08:30，20 点→20:00 不歧义，已过时间顺延明天；
+  - 确定性抽取 8 项：记住/别忘了→facts、同一内容去重不重复写、待办一次拆 3 条、
+    “提醒我早上 8 点喝水”→08:00、“晚上 8 点提醒我喝水”→20:00、裸“8点提醒”
+    →due_at 留空、无指令/空消息静默全 0 不报错；
+  - 工具与隔离 7 项：add_todo 返回含内容、list_todos、tenant-b 看不到
+    tenant-a 的待办、complete_todo 成功与不存在时不报错、add_reminder 返回含
+    “08:00”、裸 8 点返回追问“早上还是晚上”、list_reminders；
+  - 调度与送达 6 项：到点变 due、写 pending_notifications 未送达、recall 里
+    出现且 system prompt 里【待提醒】放最前面、标记已送达后下一轮不再出现、
+    重复调度不重复写通知、daily 到点后生成次日提醒；
+  - 调度器线程 1 项：`start_reminder_scheduler(interval_seconds=1)` 在进程内
+    跑起来，1 秒间隔扫到到点提醒并写入待送达。
+  - 模型未调工具时抽取仍落盘：抽取测试全程没调任何模型/工具调用，只调
+    `extract_explicit()`，提醒和事实照样进了表（这正是自动落盘要证明的）。
+- 测试中发现并修掉一个测试本身的问题（不是代码问题）：`add_reminder` 工具用
+  真实当前时间解析，19 点测“早上 8 点”会算到明天，导致 08:01 的调度断言失败；
+  改为用注入时间 `NOW=07:00` 再建一条当天 08:00 的提醒后通过。
+
+未验证（必须在服务器上实测）：
+- 真实 DeepSeek 下模型是否按新系统提示调工具：说“记住/提醒我/待办”时是否
+  真调 `remember_fact` / `add_todo` / `add_reminder`，工具成功后是否回显内容
+  和时间；被问“你记到哪里了”时是否先查三张表再回答；裸“8点”是否追问上下午。
+- 调度器线程在租户容器里是否正常跑：容器启动后 30 秒间隔扫描是否生效，
+  到点后 `pending_notifications` 是否写入，下次聊天时【待提醒】是否出现且只出现一次。
+- 网关到租户容器的提醒透传：登录后租户容器是否正常启动、提醒数据是否落在
+  该租户的专属 volume 里、两个租户的提醒是否互不干扰。
+- 端到端真人对话：用“8 点提醒我喝水”完整走一遍（设提醒→等到点→下次聊天收到提醒）。
+
 ## 2026-11-26 一租户一容器重构之后（新）
 
 重构内容：共享 agent-api 拆成一租户一容器。改了 `gateway/gateway.py`

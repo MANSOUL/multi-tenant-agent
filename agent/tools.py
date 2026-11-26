@@ -1,8 +1,10 @@
-"""工具：给一个租户建一套 LangChain 工具（共 10 个）。
+"""工具：给一个租户建一套 LangChain 工具（共 15 个）。
 
 每个工具函数都闭包了 tenant，内部只走 tenant.py 的隔离函数
 （tenant_dirs / tenant_db / safe_path）和 sandbox.py 的 run_command，
 这里不重复实现任何隔离逻辑。浏览器工具调 browser 服务。
+待办/提醒工具（2026-11-26 新增）走 memory.py 的解析和写表函数，
+同样只读写本租户的库。
 """
 import json
 import os
@@ -13,9 +15,11 @@ from urllib.error import HTTPError, URLError
 
 try:
     from .config import BROWSER_URL
+    from .memory import _add_reminder_row, _add_todo_row, parse_reminder_time
     from .tenant import safe_path, tenant_db, tenant_dirs
 except ImportError:  # 以脚本方式运行 python3 agent/app.py 时
     from config import BROWSER_URL
+    from memory import _add_reminder_row, _add_todo_row, parse_reminder_time
     from tenant import safe_path, tenant_db, tenant_dirs
 
 from langchain_core.tools import tool
@@ -170,5 +174,77 @@ def make_tools(tenant: str):
         """打开一个网页，返回标题和正文摘要；screenshot 为真时还截图保存到本租户工作区。"""
         return browse_page_impl(tenant, url, screenshot)
 
+    @tool
+    def add_todo(text: str) -> str:
+        """往本租户的待办清单里加一条。成功时返回写进去的内容，供回显。"""
+        with tenant_db(tenant) as conn:
+            ok = _add_todo_row(conn, text)
+        return f"已加入待办：{text.strip()}" if ok else f"待办里已经有：{text.strip()}"
+
+    @tool
+    def list_todos() -> str:
+        """列出本租户的待办清单（未完成在前，已完成在后）。"""
+        with tenant_db(tenant) as conn:
+            rows = conn.execute(
+                "SELECT id, text, status FROM todos ORDER BY"
+                " CASE WHEN status = 'pending' THEN 0 ELSE 1 END, id ASC"
+            ).fetchall()
+        if not rows:
+            return "待办清单还是空的"
+        return "\n".join(
+            f"[{'待办' if s == 'pending' else '已完成'} {i}] {t}"
+            for i, t, s in rows)
+
+    @tool
+    def complete_todo(todo_id: int) -> str:
+        """把本租户待办清单里的一条标为已完成（传 list_todos 里看到的 id）。"""
+        with tenant_db(tenant) as conn:
+            row = conn.execute(
+                "SELECT text FROM todos WHERE id = ? AND status = 'pending'",
+                (todo_id,)).fetchone()
+            if not row:
+                return f"没有找到编号为 {todo_id} 的未完成待办"
+            conn.execute(
+                "UPDATE todos SET status = 'done' WHERE id = ?", (todo_id,))
+        return f"已完成待办：{row[0]}"
+
+    @tool
+    def add_reminder(text: str, time_text: str = "", repeat: str = "once") -> str:
+        """给本租户设一个提醒。text 是要做的事（如“喝水”），time_text 是时间
+        （如“早上8点”“明天晚上8点”“每天早上8点”）；repeat 为 "daily" 时每天重复。
+        成功返回里含内容和时间，供模型回显；裸“8点”没说上下午时返回追问，
+        提醒先记下（时间未定），等用户补齐时间再算。"""
+        parsed = parse_reminder_time(time_text or text)
+        if repeat == "daily":
+            parsed["repeat"] = "daily"
+        with tenant_db(tenant) as conn:
+            _add_reminder_row(conn, text.strip(), parsed)
+        if parsed.get("ambiguous"):
+            return (f"已记下提醒：{text.strip()}，但“{time_text or text}”没说"
+                    f"是早上还是晚上，请告诉我是早上还是晚上，我再把时间定下来。")
+        if parsed.get("due_at"):
+            when = parsed["due_at"].replace("T", " ").split("+")[0]
+            return (f"已设好提醒：{text.strip()}，时间 {when}"
+                    f"（{'每天' if parsed['repeat'] == 'daily' else '一次'}）")
+        return (f"已记下提醒：{text.strip()}，但没解析出时间，"
+                f"请告诉我具体几点（比如“早上8点”）。")
+
+    @tool
+    def list_reminders() -> str:
+        """列出本租户的提醒（未到点的和已到点的都在内）。"""
+        with tenant_db(tenant) as conn:
+            rows = conn.execute(
+                "SELECT id, text, due_at, repeat, status FROM reminders"
+                " ORDER BY id ASC").fetchall()
+        if not rows:
+            return "提醒还是空的"
+        lines = []
+        for i, t, d, r, s in rows:
+            when = (d or "时间未定，需确认上下午").replace("T", " ").split("+")[0]
+            lines.append(
+                f"[{s} {i}] {t}，{when}，{'每天' if r == 'daily' else '一次'}")
+        return "\n".join(lines)
+
     return [run_command, read_file, write_file, list_workspace, search_file,
-            remember_fact, recall_fact, search_facts, list_facts, browse_page]
+            remember_fact, recall_fact, search_facts, list_facts, browse_page,
+            add_todo, list_todos, complete_todo, add_reminder, list_reminders]

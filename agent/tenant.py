@@ -56,6 +56,25 @@ def tenant_db(tenant: str):
         "(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, summary TEXT,"
         " up_to_ts TEXT)"
     )
+    # 待办与提醒（2026-11-26 提醒/记忆改进）：每租户独立的表，和 facts 一样
+    # 只属于本租户。reminders.due_at 为空表示时间不明确（裸“8点”没说上下午），
+    # 调度器会跳过它，等用户补齐时间再算 due_at。
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS todos"
+        "(id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT, status TEXT,"
+        " created_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS reminders"
+        "(id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT, due_at TEXT,"
+        " repeat TEXT, status TEXT, created_at TEXT)"
+    )
+    # 调度器到点后写的待送达提醒：delivered=0 表示还没在聊天里当面告诉用户。
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS pending_notifications"
+        "(id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT, text TEXT,"
+        " due_at TEXT, created_at TEXT, delivered INTEGER DEFAULT 0)"
+    )
     return conn
 
 
