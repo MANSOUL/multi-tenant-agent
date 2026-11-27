@@ -203,6 +203,16 @@ class TenantControl:
                 except Exception:  # noqa: BLE001 - 容器已停/已删时跳过
                     logger.warning("删除租户时 %s 失败，继续删除：tenant=%s",
                                    op, tenant, exc_info=True)
+        # P4：租户的 browser 容器也一起删（只删容器不删卷；删卷在下面）。
+        # 旧 fake runtime 没有这个方法时跳过（getattr 默认 None）。
+        remove_browser = getattr(
+            self.runtime, "remove_browser_container", None)
+        if remove_browser is not None:
+            try:
+                remove_browser(tenant)
+            except Exception:  # noqa: BLE001 - browser 容器已删时跳过
+                logger.warning("删除租户时删 browser 容器失败，继续删除："
+                               "tenant=%s", tenant, exc_info=True)
         self.runtime.remove_volume(tenant)
         self.users.pop(tenant, None)
         self._persist_users()

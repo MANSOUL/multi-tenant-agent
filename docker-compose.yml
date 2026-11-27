@@ -4,7 +4,9 @@
 #
 # 常驻服务：
 #   gateway  — 唯一对外端口 8080；登录 + 管租户容器 + 反向代理
-#   browser  — 共享浏览器服务（先保留，后续可按租户拆，见下面注释）
+#   browser  — 共享浏览器服务（P4 起只是 fallback：主路是每租户一个
+#              browser 容器，网关按需 docker run；共享服务默认还起，
+#              保证老行为不断，见下面 browser 服务的注释）
 #   postgres / redis — 可选（profiles: optional），当前 agent 默认不用
 #
 # 租户镜像不在这里起：先 build（见 README 快速开始），网关再用它起容器。
@@ -63,13 +65,26 @@ services:
       - "8001"
     volumes:
       # 共享浏览器先保留：所有租户共用这一个 Chromium 服务。
-      # 已知限制：租户数据现在各在自己的命名卷里，共享 browser 容器
-      # 看不到租户卷，所以截图写不到租户卷里，会落在宿主机 ./data 下；
-      # 后续要么给每个租户起一个 browser 容器，要么按需把租户卷挂进
-      # browser。浏览取标题/正文不受影响。
+      # P4：它是 fallback，不是主路——主路是每租户一个 browser 容器
+      # mt-browser-<租户>（网关登录时按需 docker run 起，见
+      # gateway/infra/runtime.py 的 ensure_browser_container；
+      # 镜像用下面的 browser-image 构建）。租户容器把租户卷挂到
+      # /data，截图落在租户卷的 workspace 里；共享容器看不到租户卷，
+      # 所以它的截图会落在宿主机 ./data 下（fallback 时工具返回里会注明）。
+      # 部署验证时老行为不断：共享服务还在、默认还起；等租户容器在
+      # 服务器上跑稳了，再考虑把它收进 profile。
       - ./data:/data
     # Chromium 在容器里跑需要共享内存，不然容易崩
     shm_size: 1gb
+
+  # 按租户 browser 容器的镜像（P4，不常驻、不自动起）：
+  #   docker compose --profile build build browser-image
+  # 构建出来就是 BROWSER_IMAGE（默认 multi-tenant-agent-browser:latest），
+  # 网关登录时按需 docker run 起 mt-browser-<租户>。
+  browser-image:
+    build: ./browser
+    image: multi-tenant-agent-browser:latest
+    profiles: ["build"]
 
   # 可选服务：当前版本 agent 默认用每租户 SQLite，不依赖它俩。
   # 留给以后做共享元数据（postgres）/ 限流缓存（redis）时用。

@@ -50,7 +50,18 @@ FORWARD_ENVS = [
     "MAX_TOOL_ROUNDS", "CONTEXT_MAX_TURNS", "CONTEXT_MAX_CHARS",
     "SUMMARY_THRESHOLD_TURNS", "GATEWAY_SECRET", "TOKEN_SECRET",
     "SANDBOX_MODE", "SANDBOX_IMAGE", "BROWSER_URL",
+    # P4：存储后端开关 + Postgres DSN 也要进租户容器，不然
+    # STORE_BACKEND=postgres 在网关设了、租户容器里还是 sqlite。
+    "STORE_BACKEND", "POSTGRES_DSN",
 ]
+
+# P4 浏览器隔离：每租户一个 browser 容器（见 infra/browser_service.py，
+# 地址解析两边各一份——网关镜像只拷 gateway/ + errors/，import 不到
+# 顶层 infra/，所以这里的两个纯函数是那边的同名复刻，保持一致）。
+BROWSER_IMAGE = os.environ.get(
+    "BROWSER_IMAGE", "multi-tenant-agent-browser:latest")
+BROWSER_PORT = 8001
+SHARED_BROWSER_URL = os.environ.get("BROWSER_URL", "http://browser:8001")
 
 
 def is_valid_tenant(tenant: str) -> bool:
@@ -68,6 +79,137 @@ def volume_name(tenant: str) -> str:
 def agent_url(tenant: str) -> str:
     """租户容器的内网地址：容器名就是 Docker 网络里的 DNS 名。"""
     return f"http://{container_name(tenant)}:8081"
+
+
+# ---------------------------------------------------------------------------
+# P4 浏览器按租户隔离：每租户一个 browser 容器 mt-browser-<租户>。
+# 容器把租户卷 mt-data-<租户> 挂到 /data，browser.py 本来就按请求里的
+# tenant 写 /data/<租户>/workspace，挂载点一换，截图自然落进租户卷
+# 的 workspace（/files/ 能直接 serve），不用改 browser.py 的逻辑。
+# 共享 browser 只做 fallback：租户容器起不来 / 调不通时走它，
+# 地址解析见 resolve_browser_url，绝不因浏览器问题拦登录。
+# ---------------------------------------------------------------------------
+
+def browser_container_name(tenant: str) -> str:
+    return f"mt-browser-{tenant}"
+
+
+def browser_url(tenant: str) -> str:
+    """租户 browser 容器的内网地址：容器名就是 Docker 网络里的 DNS 名。"""
+    return f"http://{browser_container_name(tenant)}:{BROWSER_PORT}"
+
+
+def shared_browser_url() -> str:
+    """共享 browser 的地址（BROWSER_URL 环境变量，默认 compose 里
+    常驻的 browser 服务）。"""
+    return SHARED_BROWSER_URL.rstrip("/")
+
+
+def browser_run_argv(tenant: str) -> list:
+    """创建租户 browser 容器的 docker run 参数（纯函数，方便测试）。
+
+    - 租户卷挂到 /data：截图写 /data/<租户>/workspace/browser-*.png，
+      正好是租户卷里的 workspace，和租户 agent 容器看到的同一份。
+    - Chromium 在容器里跑需要共享内存（--shm-size 1g，和 compose 里
+      browser 服务的 shm_size 一致）。
+    - 镜像名 BROWSER_IMAGE：compose 里 browser-image（profile build）
+      构建出来的就是这个名字，部署前先 build 它。
+    """
+    return [
+        "run", "-d",
+        "--name", browser_container_name(tenant),
+        "--network", DOCKER_NETWORK,
+        "--restart", "unless-stopped",
+        "--shm-size", "1g",
+        "-v", f"{volume_name(tenant)}:/data",
+        "-e", "PORT=8001",
+        "-e", "DATA_DIR=/data",
+        BROWSER_IMAGE,
+    ]
+
+
+def browser_container_state(tenant: str) -> str:
+    """租户 browser 容器状态：running / stopped / missing。"""
+    rc, out, _ = _docker(
+        ["inspect", "-f", "{{.State.Running}}",
+         browser_container_name(tenant)],
+        timeout=30)
+    if rc != 0:
+        return "missing"
+    return "running" if out.strip() == "true" else "stopped"
+
+
+def resolve_browser_url(tenant: str, state: str | None = None):
+    """解析该租户该调哪个 browser 服务。
+
+    state 不传就现查容器状态。返回 (url, via_tenant)：租户容器在跑
+    → (租户地址, True)；否则 → (共享地址, False)，并记一条 warning。
+    本函数不抛异常——浏览器地址解析绝不能拦登录/聊天。
+    """
+    try:
+        if not is_valid_tenant(tenant):
+            logger.warning("租户 id 不合法，browser 走共享 fallback：%r",
+                           tenant)
+            return shared_browser_url(), False
+        st = state if state is not None else browser_container_state(tenant)
+        if st == "running":
+            return browser_url(tenant), True
+        logger.warning("租户浏览器容器不在跑（state=%s），走共享 browser "
+                       "fallback：tenant=%s", st, tenant)
+        return shared_browser_url(), False
+    except Exception:  # noqa: BLE001 - 地址解析失败就走共享，不拦路
+        logger.warning("解析租户浏览器地址异常，走共享 fallback：tenant=%s",
+                       tenant, exc_info=True)
+        return shared_browser_url(), False
+
+
+def ensure_browser_container(tenant: str) -> bool:
+    """保证租户 browser 容器在跑且 /health 已通。
+
+    不存在 → docker run 创建；已停止 → docker start；已在跑 →
+    直接等健康检查。返回 True 表示租户浏览器可用，False 表示
+    不可用（调用方走共享 fallback）。任何失败都只记日志、不抛
+    异常——浏览器起不来绝不能拦登录。
+    """
+    try:
+        if not is_valid_tenant(tenant):
+            logger.warning("租户 id 不合法，跳过租户浏览器创建：%r", tenant)
+            return False
+        state = browser_container_state(tenant)
+        if state == "missing":
+            rc, _out, err = _docker(browser_run_argv(tenant), timeout=180)
+            if rc != 0:
+                logger.warning("创建租户浏览器容器失败，走共享 fallback："
+                               "tenant=%s err=%s", tenant, err)
+                return False
+        elif state == "stopped":
+            rc, _out, err = _docker(
+                ["start", browser_container_name(tenant)], timeout=60)
+            if rc != 0:
+                logger.warning("启动租户浏览器容器失败，走共享 fallback："
+                               "tenant=%s err=%s", tenant, err)
+                return False
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if _http_ok(browser_url(tenant) + "/health"):
+                return True
+            time.sleep(1)
+        logger.warning("租户浏览器容器启动超时（/health 10 秒不通），"
+                       "走共享 fallback：tenant=%s", tenant)
+        return False
+    except Exception:  # noqa: BLE001 - 浏览器保障绝不能拦登录
+        logger.warning("保障租户浏览器容器异常，走共享 fallback：tenant=%s",
+                       tenant, exc_info=True)
+        return False
+
+
+def remove_browser_container(tenant: str) -> None:
+    """删租户 browser 容器（docker rm -f；只删容器不删卷——
+    截图在租户卷里，删卷是 delete_tenant 另外的步骤）。"""
+    rc, _, err = _docker(["rm", "-f", browser_container_name(tenant)],
+                         timeout=60)
+    if rc != 0:
+        raise RuntimeError(f"删除租户浏览器容器失败：{err or 'docker rm 失败'}")
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +335,10 @@ def reap_idle(now: float | None = None) -> list:
     for tenant, ts in candidates:
         if should_stop(ts, IDLE_MINUTES, now):
             _docker(["stop", container_name(tenant)], timeout=60)
+            # P4：租户容器停了，它的 browser 容器也一起停（只 stop 不 rm，
+            # 下次登录 ensure 时再 start；失败不致命，记不记日志都行，
+            # 这里不检查返回值）。
+            _docker(["stop", browser_container_name(tenant)], timeout=60)
             with _last_active_lock:
                 _last_active.pop(tenant, None)
             stopped.append(tenant)
@@ -345,3 +491,15 @@ class DockerRuntime:
 
     def ensure_fresh(self, tenant: str) -> bool:
         return ensure_fresh(tenant)
+
+    def ensure_browser_container(self, tenant: str) -> bool:
+        return ensure_browser_container(tenant)
+
+    def resolve_browser_url(self, tenant: str):
+        return resolve_browser_url(tenant)
+
+    def browser_container_state(self, tenant: str) -> str:
+        return browser_container_state(tenant)
+
+    def remove_browser_container(self, tenant: str) -> None:
+        remove_browser_container(tenant)

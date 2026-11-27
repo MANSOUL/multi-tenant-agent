@@ -2,7 +2,7 @@
 
 从 agent/memory.py 的 load_context 和 agent/graph.py 的 _system_prompt
 原样搬过来（P0 搬移），只做两处改变：
-1. 读库走 store（SQLiteStore），不再在 memory.py 里拼 SQL；
+1. 读库走 store（create_store 按 STORE_BACKEND 选实现），不再在 memory.py 里拼 SQL；
 2. 摘要后旧行不再 DELETE，改成归档（store/archive_turns）——见
    store/event_log.py，chat_log 只追加。
 
@@ -22,7 +22,7 @@ try:
         estimate_tokens,
     )
     from model.client import has_api_key
-    from store.sqlite_store import SQLiteStore
+    from store import create_store
 except ImportError:  # 以脚本方式运行 python3 agent/app.py 时，项目根目录不在 path 上
     import sys
     from pathlib import Path
@@ -36,7 +36,7 @@ except ImportError:  # 以脚本方式运行 python3 agent/app.py 时，项目�
         estimate_tokens,
     )
     from model.client import has_api_key
-    from store.sqlite_store import SQLiteStore
+    from store import create_store
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -108,7 +108,7 @@ def assemble_context(tenant: str, llm=None, max_turns=None, max_chars=None,
     summarized = False
     truncated = False
     with tenant_db(tenant) as conn:
-        store = SQLiteStore(conn)
+        store = create_store(conn)
         facts = "\n".join(
             f"- {k}: {v}" for k, v in store.get_facts())
         summary = store.latest_summary()

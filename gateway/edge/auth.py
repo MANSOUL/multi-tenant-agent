@@ -15,6 +15,7 @@ from pathlib import Path
 try:
     from ..infra.runtime import (
         container_name,
+        ensure_browser_container,
         ensure_fresh,
         ensure_tenant_container,
         is_valid_tenant,
@@ -29,6 +30,7 @@ except ImportError:  # 以脚本方式直接跑某个网关模块时，包相对
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from gateway.infra.runtime import (
         container_name,
+        ensure_browser_container,
         ensure_fresh,
         ensure_tenant_container,
         is_valid_tenant,
@@ -105,12 +107,15 @@ LOGIN_HTML = _load_login_page()
 
 
 def attempt_login(username: str, password: str, users: dict | None = None,
-                  ensure_fresh_fn=None, ensure_container_fn=None) -> str:
+                  ensure_fresh_fn=None, ensure_container_fn=None,
+                  ensure_browser_fn=None) -> str:
     """登录路径（edge/auth.py 是调用 runtime.ensure_fresh 的入口）。
 
     密码对上 → 先 ensure_fresh() 比对镜像 digest（变了就自动重建租户
     容器；docker 不可用时 fail-open，只记日志，不拦登录）→ 再
-    ensure_tenant_container() 起容器 → 返回 HMAC 签名 token。
+    ensure_tenant_container() 起容器 → 再 ensure_browser_container()
+    起该租户的 browser 容器（P4：起不来只记日志、走共享 fallback，
+    不拦登录）→ 返回 HMAC 签名 token。
     失败时抛 ApiError（调用方直接 _send_error）：密码不对 401、租户 id
     不合法 400、容器起不来 502。ensure_* 可注入，方便测试。
     """
@@ -131,6 +136,12 @@ def attempt_login(username: str, password: str, users: dict | None = None,
         ensure_fn(name)
     except RuntimeError as e:
         raise upstream_unavailable(f"租户容器启动失败：{e}")
+    browser_fn = ensure_browser_fn or ensure_browser_container
+    try:
+        browser_fn(name)
+    except Exception:  # noqa: BLE001 - 浏览器起不来走共享，不拦登录
+        logger.warning("登录时保障租户浏览器容器异常，走共享 fallback："
+                       "tenant=%s", name, exc_info=True)
     return make_token(name)
 
 

@@ -21,7 +21,7 @@ try:
         due_day_label,
         parse_reminder_time,
     )
-    from store.sqlite_store import SQLiteStore
+    from store import create_store
 except ImportError:  # 以脚本方式运行 python3 agent/app.py 时，项目根目录不在 path 上
     import sys
     from pathlib import Path
@@ -33,24 +33,24 @@ except ImportError:  # 以脚本方式运行 python3 agent/app.py 时，项目�
         due_day_label,
         parse_reminder_time,
     )
-    from store.sqlite_store import SQLiteStore
+    from store import create_store
 
 
 
 def _remember_fact_once(conn, key: str, value: str) -> bool:
     """facts 去重写：同一 value 已存在就不重复写。返回是否真的写了。
     （P0：SQL 在 store/sqlite_store.py，这里只调 store；tools.py 还调这个函数，签名不变。）"""
-    return SQLiteStore(conn).remember_fact_once(key, value)
+    return create_store(conn).remember_fact_once(key, value)
 
 
 def _add_todo_row(conn, text: str) -> bool:
     """写一条待办（去重）。P0：SQL 在 store，这里只调 store；tools.py 还调这个函数，签名不变。"""
-    return SQLiteStore(conn).add_todo(text)
+    return create_store(conn).add_todo(text)
 
 
 def _add_reminder_row(conn, text: str, parsed: dict) -> bool:
     """写一条提醒（去重）。P0：SQL 在 store，这里只调 store；tools.py 还调这个函数，签名不变。"""
-    return SQLiteStore(conn).add_reminder(text, parsed)
+    return create_store(conn).add_reminder(text, parsed)
 
 
 def extract_explicit(text: str, tenant: str, now=None) -> dict:
@@ -148,7 +148,7 @@ def mark_notifications_delivered(tenant: str, notification_ids) -> None:
         return
     try:
         with tenant_db(tenant) as conn:
-            store = SQLiteStore(conn)
+            store = create_store(conn)
             rows = store.mark_notifications_delivered(tenant, ids)
             for rtext, due_at in rows:
                 store.mark_reminder_notified(rtext, due_at)

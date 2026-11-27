@@ -16,14 +16,15 @@ from typing import Annotated, TypedDict
 try:
     from agent.config import MODEL, TENANT_ID
     from agent.memory import extract_explicit, mark_notifications_delivered
-    from agent.tenant import tenant_db
+    from agent.tenant import checkpoint_db_path, tenant_db
     from context.assembler import assemble_context, build_system_prompt
+    from infra import checkpoints as checkpoints_mod
     from loop.config import AgentLoopConfig
     from loop.hooks import LoopHooks
     from loop.loop import decide_next
     from model.client import create_client, invoke
     from observability import metrics as obs_metrics
-    from store.sqlite_store import SQLiteStore
+    from store import create_store
     from tools.permissions import DENY, log_audit
     from tools.registry import make_tools
 except ImportError:  # 以脚本方式跑时项目根目录不在 path 上
@@ -32,14 +33,15 @@ except ImportError:  # 以脚本方式跑时项目根目录不在 path 上
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from agent.config import MODEL, TENANT_ID
     from agent.memory import extract_explicit, mark_notifications_delivered
-    from agent.tenant import tenant_db
+    from agent.tenant import checkpoint_db_path, tenant_db
     from context.assembler import assemble_context, build_system_prompt
+    from infra import checkpoints as checkpoints_mod
     from loop.config import AgentLoopConfig
     from loop.hooks import LoopHooks
     from loop.loop import decide_next
     from model.client import create_client, invoke
     from observability import metrics as obs_metrics
-    from store.sqlite_store import SQLiteStore
+    from store import create_store
     from tools.permissions import DENY, log_audit
     from tools.registry import make_tools
 
@@ -88,20 +90,26 @@ def _record_metering(tenant: str, input_text: str, reply) -> None:
             else "".join(p.get("text", "") for p in reply.content
                          if isinstance(p, dict) and p.get("type") == "text")
         with tenant_db(tenant) as conn:
-            SQLiteStore(conn).record_metering(
+            create_store(conn).record_metering(
                 tenant, MODEL, input_text, output_text)
     except Exception:
         pass
 
 
 def build_graph(tenant: str, loop_config: AgentLoopConfig | None = None,
-                hooks: LoopHooks | None = None):
+                hooks: LoopHooks | None = None, checkpointer=None):
     """给这个租户建图。tenant 只进 state 和工具闭包，不会出现在别的租户的图里。
 
     loop_config 不传就用环境变量默认值（AgentLoopConfig.from_env）；
-    hooks 不传就是空实现。图本身无状态（没有 checkpointer）；跨轮次
-    的记忆靠每租户 SQLite 的 facts / chat_log / summaries / todos /
-    reminders / pending_notifications 表。
+    hooks 不传就是空实现。
+    checkpointer 不传就按租户取默认的 SqliteSaver（每租户一个
+    checkpoint.db，见 infra/checkpoints.py；CHECKPOINTER_ENABLED=0
+    或依赖缺失时返回 None，图回到无 checkpointer 的老行为）。
+    有 checkpointer 时，调用方必须在 invoke 的 config 里传
+    configurable.thread_id（会话 id，见 loop/loop.py 的 run_graph），
+    否则 invoke 直接报 ValueError（langgraph 的要求：带 checkpointer
+    的图必须带 thread_id / checkpoint_ns / checkpoint_id 之一）；
+    目前唯一的生产调用方 app/chat_service.py 每次都传 sid。
     """
     config = loop_config or AgentLoopConfig.from_env()
     hooks = hooks or LoopHooks()
@@ -206,7 +214,7 @@ def build_graph(tenant: str, loop_config: AgentLoopConfig | None = None,
                 pass  # 自动落盘绝不阻塞聊天
         if user_text or ai_text:
             with tenant_db(tenant) as conn:
-                store = SQLiteStore(conn)
+                store = create_store(conn)
                 now = datetime.now(timezone.utc).isoformat()
                 if user_text:
                     store.append_chat(now, "user", user_text)
@@ -239,14 +247,23 @@ def build_graph(tenant: str, loop_config: AgentLoopConfig | None = None,
     graph.add_edge("tools", "llm")
     graph.add_edge("final_llm", "save_memory")
     graph.add_edge("save_memory", END)
-    # 图本身无状态（没有 checkpointer），每次请求现建图；
-    # 跨轮次的记忆靠每租户 SQLite 的 facts / chat_log 表。
+    # P4：图挂上 checkpointer（默认按租户取 SqliteSaver，见上面
+    # build_graph 的说明）。跨轮次的记忆仍有两份：图内多轮消息状态
+    # 在 checkpoint.db 里，摘要 + 长期事实等派生上下文还在每租户
+    # SQLite 的 facts / chat_log / summaries / todos / reminders /
+    # pending_notifications 表里（P0 的 event_log 不动）。
     # P3：图实例按会话复用，复用逻辑在 session/session.py，
     # 这里只负责建图。
-    return graph.compile()
+    if checkpointer is None:
+        try:
+            checkpointer = checkpoints_mod.get_checkpointer(
+                checkpoint_db_path(tenant))
+        except Exception:  # noqa: BLE001 - checkpointer 建不出来就无状态跑
+            checkpointer = None
+    return graph.compile(checkpointer=checkpointer)
 
 
-def collect_events(result: dict) -> list:
+def collect_events(result: dict, since_index: int | None = None) -> list:
     """从一次图执行结果里收集前端事件（纯函数，见 docs/FRONTEND_PROTOCOL.md）。
 
     顺序：先是本轮送达的提醒（recall_memory 时读到的待送达提醒，
@@ -254,6 +271,9 @@ def collect_events(result: dict) -> list:
     P1 只产这两种事件；"chat" 类型已在协议里占位，本阶段不发。
     result 是 graph.invoke 的返回：messages 里带 tool_calls 的 AIMessage、
     due_notifications 是 recall_memory 读到的待送达提醒列表。
+    since_index：有 checkpointer 时，result["messages"] 里带了本会话
+    全部历史消息，只取下标 >= since_index 的那一段（本轮新产生的），
+    不然第二轮会把第一轮的工具调用事件再推一遍；不传就是全量（老行为）。
     """
     events = []
     for n in result.get("due_notifications") or []:
@@ -263,7 +283,10 @@ def collect_events(result: dict) -> list:
             "text": n.get("text"),
             "due_at": n.get("due_at"),
         })
-    for msg in result.get("messages") or []:
+    messages = result.get("messages") or []
+    if since_index is not None:
+        messages = messages[since_index:]
+    for msg in messages:
         if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
             for tc in msg.tool_calls:
                 events.append({

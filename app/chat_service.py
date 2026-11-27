@@ -19,8 +19,11 @@ from datetime import datetime, timezone
 
 try:
     from agent.config import MODEL, TENANT_ID
-    from agent.tenant import is_own_tenant, tenant_db, tenant_dirs
+    from agent.tenant import (
+        checkpoint_db_path, is_own_tenant, tenant_db, tenant_dirs,
+    )
     from domain.memory import estimate_tokens
+    from infra import checkpoints as checkpoints_mod
     from infra.graph import (
         _extract_reply,
         build_graph,
@@ -32,15 +35,18 @@ try:
     from model.client import has_api_key
     from security.guardrails import check_injection, guardrail_note, log_injection
     from session.session import DEFAULT_SESSION_ID, SessionManager
-    from store.sqlite_store import SQLiteStore
+    from store import create_store
     from .reminder_service import PERIOD_WORDS, ReminderService
 except ImportError:  # 以脚本方式跑时项目根目录在 path 上
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from agent.config import MODEL, TENANT_ID
-    from agent.tenant import is_own_tenant, tenant_db, tenant_dirs
+    from agent.tenant import (
+        checkpoint_db_path, is_own_tenant, tenant_db, tenant_dirs,
+    )
     from domain.memory import estimate_tokens
+    from infra import checkpoints as checkpoints_mod
     from infra.graph import (
         _extract_reply,
         build_graph,
@@ -52,7 +58,7 @@ except ImportError:  # 以脚本方式跑时项目根目录在 path 上
     from model.client import has_api_key
     from security.guardrails import check_injection, guardrail_note, log_injection
     from session.session import DEFAULT_SESSION_ID, SessionManager
-    from store.sqlite_store import SQLiteStore
+    from store import create_store
     from app.reminder_service import PERIOD_WORDS, ReminderService
 
 from langchain_core.messages import HumanMessage
@@ -114,6 +120,10 @@ class ChatService:
             # id——from-import 抓到的名字是旧引用，测试换假模型时盐值
             # 不变，旧图会被误复用（已实测踩过这个坑）。
             salt=id(client_mod.ChatOpenAI))
+        # P4：读本轮之前该会话在 checkpointer 里已存的消息条数，
+        # 用来给 collect_events 切片（只推本轮新产生的工具调用事件）。
+        # 没开 checkpointer 时是 0，切片等于全量，老行为不变。
+        prior_messages = self._prior_message_count(tenant, sid)
         try:
             result = run_graph(
                 graph,
@@ -121,14 +131,16 @@ class ChatService:
                  "tenant_id": tenant, "steps": 0, "facts": "", "summary": "",
                  "history_text": "", "todos": "", "reminders": "",
                  "due_notifications": [], "guardrail_note": note},
-                self.loop_config)
+                self.loop_config, thread_id=sid)
         except TimeoutError as e:
             raise RuntimeError(f"模型调用超时：{e}")
         except Exception as e:  # noqa: BLE001 - 模型接口报错时原样告诉用户
             raise RuntimeError(f"模型调用失败：{e}")
         reply = _extract_reply(result)
         self._record_turn(tenant, sid, user_text, reply, started_at)
-        return {"reply": reply, "events": collect_events(result),
+        return {"reply": reply,
+                "events": collect_events(result,
+                                         since_index=prior_messages),
                 "session_id": sid}
 
     def chat_text(self, tenant: str, user_text: str,
@@ -137,13 +149,29 @@ class ChatService:
         return self.chat(tenant, user_text, session_id)["reply"]
 
     # -- 内部：落盘 ------------------------------------------------------
+    def _prior_message_count(self, tenant: str, session_id: str) -> int:
+        """该会话在 checkpointer 里已存的消息条数（没有返回 0）。
+
+        临时开一个 saver 只读快照，读完就关连接；图实例自己持有的
+        saver 不在这里关。任何失败都返回 0（退化成老行为：事件全量），
+        绝不阻塞聊天。
+        """
+        saver = None
+        try:
+            saver = checkpoints_mod.get_checkpointer(
+                checkpoint_db_path(tenant))
+            return checkpoints_mod.get_message_count(saver, session_id)
+        except Exception:
+            return 0
+        finally:
+            checkpoints_mod.close_checkpointer(saver)
     def _append_turn_text(self, tenant: str, user_text: str,
                           reply_text: str) -> None:
         """澄清捷径不走图，所以这一问一答要自己写进 chat_log，
         不然历史里会少一轮。失败不阻塞（主回复已经有了）。"""
         try:
             with tenant_db(tenant) as conn:
-                store = SQLiteStore(conn)
+                store = create_store(conn)
                 now = datetime.now(timezone.utc).isoformat()
                 store.append_chat(now, "user", user_text)
                 store.append_chat(now, "assistant", reply_text)
@@ -158,7 +186,7 @@ class ChatService:
             workspace, _, _ = tenant_dirs(tenant)
             tokens = estimate_tokens((user_text or "") + (reply_text or ""))
             with tenant_db(tenant) as conn:
-                SQLiteStore(conn).record_turn(
+                create_store(conn).record_turn(
                     session_id, tenant, str(workspace), APPROVAL_POLICY,
                     os.environ.get("SANDBOX_MODE", "docker"), MODEL,
                     tokens, started_at,

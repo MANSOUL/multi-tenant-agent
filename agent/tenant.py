@@ -54,6 +54,17 @@ def tenant_db(tenant: str):
     return conn
 
 
+def checkpoint_db_path(tenant: str) -> Path:
+    """本租户 checkpointer 的 SQLite 文件（P4）。
+
+    和 memory.db 分开的文件 checkpoint.db：图内多轮消息状态只写
+    这里，不碰记忆库，避免互相干扰。父目录不存在就建出来。
+    """
+    base = DATA_DIR / tenant
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "checkpoint.db"
+
+
 def safe_path(tenant: str, rel: str) -> Path:
     workspace, _, _ = tenant_dirs(tenant)
     p = (workspace / rel).resolve()

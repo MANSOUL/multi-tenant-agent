@@ -11,6 +11,15 @@ POST /browse  {url, screenshot, tenant}
 要持久化登录态时，把 launch_persistent_context 的 user_data_dir
 指到该租户的 profile 目录即可（见 README 待讨论问题）。
 
+P4 浏览器隔离：同一个服务、同一份代码，两种挂法——
+- 共享容器（compose 的 browser 服务）：DATA_DIR=/data 挂宿主机
+  ./data，截图落在宿主机 ./data/<租户>/workspace，不在租户卷里
+  （P4 之前唯一的挂法，也是现在的 fallback）；
+- 租户容器（mt-browser-<租户>，网关按需 docker run 起）：
+  DATA_DIR=/data 挂租户卷 mt-data-<租户>，截图写
+  /data/<租户>/workspace 时正好落在租户卷的 workspace 里，
+  /files/ 能直接 serve。代码不用改，挂载点决定了截图落在哪。
+
 启动：python3 browser.py ，端口 8001（仅容器内网）
 环境变量：PORT / DATA_DIR
 依赖：playwright==1.49.0（见 requirements.txt，镜像里已装好浏览器）

@@ -68,12 +68,22 @@ def _call_with_timeout(fn, timeout_seconds: float):
     return value
 
 
-def run_graph(graph, initial_state: dict, config: AgentLoopConfig):
+def run_graph(graph, initial_state: dict, config: AgentLoopConfig,
+              thread_id: str | None = None):
     """调一张编译好的 LangGraph 图：recursion_limit 走 config，
-    整轮超时走 config.timeout_seconds。"""
+    整轮超时走 config.timeout_seconds。
+
+    thread_id：P4 checkpointer 的会话 id（不传就不带 configurable；
+    注意：图如果挂了 checkpointer，不带 thread_id 时 invoke 直接
+    报 ValueError——目前唯一的生产调用方 app/chat_service.py 每次
+    都传会话 id；没挂 checkpointer 的图（FakeGraph / 关掉开关时）
+    不传也能跑，和原来一样）。
+    """
+    invoke_config: dict = {"recursion_limit": config.recursion_limit}
+    if thread_id:
+        invoke_config["configurable"] = {"thread_id": thread_id}
     return _call_with_timeout(
-        lambda: graph.invoke(
-            initial_state, config={"recursion_limit": config.recursion_limit}),
+        lambda: graph.invoke(initial_state, config=invoke_config),
         config.timeout_seconds)
 
 

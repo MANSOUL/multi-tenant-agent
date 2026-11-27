@@ -1,7 +1,7 @@
 """提醒用例（应用层）：设/改/查/到点。
 
 编排提醒这一个用例，不认识 HTTP、SQL、LangGraph 图细节：解析走
-domain/reminder，落盘走 store/sqlite_store.py（SQLiteStore），
+domain/reminder，落盘走 store/（create_store 按 STORE_BACKEND 选实现），
 时间词剥离的正则和 agent/memory.py 的 extract_explicit 共用同一份
 写法（见 _strip_time_words）。
 
@@ -11,7 +11,7 @@ domain/reminder，落盘走 store/sqlite_store.py（SQLiteStore），
    时直接调 set_reminder，不再经过模型问确认。
 2. 去重：set_reminder 先查同租户、同内容、同时间 ±5 分钟内已有的
    pending 提醒，有就直接返回已有的那条，不新建（store 层也有一道
-   同样的防线，见 SQLiteStore.add_reminder）。
+   同样的防线，见 store 的 add_reminder）。
 """
 import re
 from datetime import datetime, timedelta, timezone
@@ -26,7 +26,7 @@ try:
         parse_reminder_time,
         reminder_tz,
     )
-    from store.sqlite_store import SQLiteStore
+    from store import create_store
 except ImportError:  # 以脚本方式跑时项目根目录在 path 上
     import sys
     from pathlib import Path
@@ -40,7 +40,7 @@ except ImportError:  # 以脚本方式跑时项目根目录在 path 上
         parse_reminder_time,
         reminder_tz,
     )
-    from store.sqlite_store import SQLiteStore
+    from store import create_store
 
 # 裸上下午回答：只有这几个词才算澄清（不含时间、不含其它内容），
 # 多一个字都不接——接错了会把一句正常聊天当成设提醒。
@@ -120,7 +120,7 @@ class ReminderService:
             return (f"“{time_text or text}”里没解析出时间，这条提醒还没存。"
                     f"请问用户具体几点（比如“早上8点”或“19:20”）。")
         with tenant_db(tenant) as conn:
-            store = SQLiteStore(conn)
+            store = create_store(conn)
             existing = store.find_pending_reminder_near(
                 text.strip(), parsed["due_at"])
             if existing:
@@ -147,7 +147,7 @@ class ReminderService:
             return (f"“{new_time_text}”里没解析出时间，这条提醒还没改。"
                     f"请问用户具体几点（比如“晚上7点20分”或“19:20”）。")
         with tenant_db(tenant) as conn:
-            store = SQLiteStore(conn)
+            store = create_store(conn)
             row = store.find_reminder_for_update(reminder_id, text)
             if row is None:
                 return "没有找到要改的那条提醒，请先用 list_reminders 查一下编号。"
@@ -169,7 +169,7 @@ class ReminderService:
         status_label = {"pending": "待提醒", "due": "已到点",
                         "notified": "已提醒", "done": "已完成"}
         with tenant_db(tenant) as conn:
-            store = SQLiteStore(conn)
+            store = create_store(conn)
             rows = store.list_all_reminders()
         if not rows:
             return "提醒还是空的"
@@ -192,7 +192,7 @@ class ReminderService:
         调用方走正常模型路径，绝不猜。
         """
         with tenant_db(tenant) as conn:
-            store = SQLiteStore(conn)
+            store = create_store(conn)
             rows = store.list_all_chat_rows()
         rows = rows[-8:]  # 只看最近几行，旧对话里的追问不算
         for idx in range(len(rows) - 1, 0, -1):
@@ -231,7 +231,7 @@ class ReminderService:
         try:
             now_dt = _now_in_tz(now)
             with tenant_db(tenant) as conn:
-                store = SQLiteStore(conn)
+                store = create_store(conn)
                 for rid, rtext, due_at, repeat in store.list_due_candidates():
                     try:
                         due = datetime.fromisoformat(due_at)

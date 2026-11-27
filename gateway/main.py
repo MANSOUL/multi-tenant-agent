@@ -32,6 +32,7 @@ try:
     from .infra.runtime import (
         _reaper_loop,
         container_name,
+        ensure_browser_container,
         ensure_fresh,
         ensure_tenant_container,
         reap_idle,
@@ -52,6 +53,7 @@ except ImportError:  # 以脚本方式跑 python3 gateway/main.py 时
     from gateway.infra.runtime import (
         _reaper_loop,
         container_name,
+        ensure_browser_container,
         ensure_fresh,
         ensure_tenant_container,
         reap_idle,
@@ -110,7 +112,8 @@ class Handler(BaseHTTPRequestHandler):
                 token = attempt_login(
                     name, payload.get("password") or "", users=USERS,
                     ensure_fresh_fn=ensure_fresh,
-                    ensure_container_fn=ensure_tenant_container)
+                    ensure_container_fn=ensure_tenant_container,
+                    ensure_browser_fn=ensure_browser_container)
             except ApiError as e:
                 return self._send_error(e)
             return self._send(200, json.dumps(
@@ -172,6 +175,7 @@ __all__ = [
     "LOGIN_HTML",
     "attempt_login",
     "container_name",
+    "ensure_browser_container",
     "ensure_fresh",
     "ensure_tenant_container",
     "load_users",

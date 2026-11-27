@@ -18,6 +18,18 @@ COPY context/ ./context/
 # agent/web/chat.html 随 COPY agent/ 一起进镜像，不用单独拷。
 COPY errors/ ./errors/
 COPY observability/ ./observability/
+# P3/P4 新增的顶层包：app/（编排）tools/（工具层）loop/（循环控制）
+# session/（会话）security/（安全横切）infra/（图接线 + checkpointer
+# + 浏览器路由）。P3 时漏拷了它们——agent/graph.py、agent/server.py、
+# agent/memory.py 都 import 这些包，不拷进镜像容器里会 ImportError；
+# P4 的 infra/checkpoints.py、infra/browser_service.py 也在这里，
+# 不拷的话 checkpointer 和租户浏览器路由在容器里不可用。
+COPY app/ ./app/
+COPY tools/ ./tools/
+COPY loop/ ./loop/
+COPY session/ ./session/
+COPY security/ ./security/
+COPY infra/ ./infra/
 # 让 `python3 agent/app.py` 脚本模式也能 import 顶层包（否则 sys.path
 # 只有 agent/ 目录，`import domain` 会失败）。
 ENV PYTHONPATH=/app

@@ -1,7 +1,7 @@
 """长期记忆工具定义（工具层）：remember_fact / recall_fact /
 list_facts / search_facts。
 
-只做参数校验 + 调 store/sqlite_store.py（SQLiteStore），不再自己
+只做参数校验 + 调 store/（create_store 按 STORE_BACKEND 选实现），不再自己
 写业务逻辑；执行前过 tools/executor.py 的权限检查（见
 tools/registry.py 拼出来的 LangChain 工具）。
 """
@@ -10,13 +10,13 @@ from datetime import datetime, timezone
 
 try:
     from agent.tenant import tenant_db
-    from store.sqlite_store import SQLiteStore
+    from store import create_store
 except ImportError:  # 以脚本方式跑时项目根目录在 path 上
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from agent.tenant import tenant_db
-    from store.sqlite_store import SQLiteStore
+    from store import create_store
 
 
 def specs(tenant: str) -> list:
@@ -32,17 +32,17 @@ def specs(tenant: str) -> list:
 
     def _recall(args):
         with tenant_db(tenant) as conn:
-            value = SQLiteStore(conn).recall_fact(args["key"])
+            value = create_store(conn).recall_fact(args["key"])
         return value if value else "没记过这件事"
 
     def _list(args):
         with tenant_db(tenant) as conn:
-            rows = SQLiteStore(conn).get_facts()
+            rows = create_store(conn).get_facts()
         return "\n".join(f"{k}: {v}" for k, v in rows) or "记忆还是空的"
 
     def _search(args):
         with tenant_db(tenant) as conn:
-            rows = SQLiteStore(conn).search_facts(args["keyword"])
+            rows = create_store(conn).search_facts(args["keyword"])
         return "\n".join(f"{k}: {v}" for k, v in rows) or "记忆里没找到相关的事"
 
     return [
