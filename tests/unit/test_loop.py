@@ -220,10 +220,19 @@ class TestPermissions(unittest.TestCase):
             [e for e in perm_mod.audit_log()
              if e["tool"] == "no_such_tool_xyz"][0]["decision"], "deny")
 
-    def test_ask_logs_audit_and_refuses(self):
+    def test_write_inside_workspace_executes(self):
+        # 2026-11-27 修正：工作区内的写文件放行（P3 初版一律 ask 是回归，
+        # 做网页功能因此不可用）；越出工作区才走 ask。
         out = executor_mod.execute_tool(
             "demo", "write_file",
             {"path": "x.txt", "content": "hi"},
+            lambda args: "已写入")
+        self.assertEqual(out, "已写入")
+
+    def test_ask_logs_audit_and_refuses(self):
+        out = executor_mod.execute_tool(
+            "demo", "write_file",
+            {"path": "../x.txt", "content": "hi"},
             lambda args: "不该写进去")
         self.assertIn("需要确认", out)
         entries = [e for e in perm_mod.audit_log()
@@ -232,12 +241,13 @@ class TestPermissions(unittest.TestCase):
         self.assertEqual(entries[0]["decision"], "ask_denied")
         self.assertEqual(entries[0]["tenant"], "demo")
 
-    def test_ask_run_command_refuses(self):
+    def test_run_command_allowed_in_sandbox(self):
+        # 2026-11-27 修正：run_command 在沙箱内跑，破坏半径与写文件
+        # 相同，放行；P3 初版的 ask 拒绝是同一回归的一部分。
         out = executor_mod.execute_tool(
             "demo", "run_command", {"command": "ls"},
-            lambda args: "不该跑")
-        self.assertIn("需要确认", out)
-        self.assertNotIn("不该跑", out)
+            lambda args: "文件列表")
+        self.assertEqual(out, "文件列表")
 
     def test_allow_read_tool_executes(self):
         out = executor_mod.execute_tool(
