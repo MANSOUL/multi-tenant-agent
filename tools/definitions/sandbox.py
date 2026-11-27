@@ -1,10 +1,9 @@
 """沙箱工具定义（工具层）：run_command。
 
 只做参数校验 + 调 agent/sandbox.py 的 run_command，不再自己写业务
-逻辑；执行前过 tools/executor.py 的权限检查——run_command 默认
-是 ask（没有审批通道时拒绝执行并记审计，见 tools/permissions.py），
-所以模型通过工具跑命令时会被挡下来，这是 P3 权限管线有意的
-行为（见汇报“取舍”）。
+逻辑；执行前过 tools/executor.py 的权限检查——run_command 在沙箱
+（--read-only、--network none、--cap-drop ALL，只挂工作区）内跑，
+破坏半径与工作区内写文件相同，所以放行，见 tools/permissions.py。
 """
 import inspect
 

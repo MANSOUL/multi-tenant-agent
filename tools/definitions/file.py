@@ -2,10 +2,9 @@
 search_file。
 
 只做参数校验 + 调 agent/tenant.py 的路径隔离函数，不再自己写业务
-逻辑；执行前过 tools/executor.py 的权限检查——其中 write_file
-默认是 ask（没有审批通道时拒绝执行并记审计，见
-tools/permissions.py），所以模型通过工具写文件时会被挡下来，
-这是 P3 权限管线有意的行为（见汇报“取舍”）。
+逻辑；执行前过 tools/executor.py 的权限检查——write_file 在工作区内
+放行（权限层先按路径判，执行时 safe_path 再拦一次），写到工作区
+之外时走 ask（无审批通道 = 拒绝），见 tools/permissions.py。
 """
 import inspect
 import os
