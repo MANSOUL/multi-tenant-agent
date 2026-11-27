@@ -14,6 +14,16 @@ infra/runtime.DockerRuntime，薄包装 subprocess docker CLI；测试时
 P3 才有的模块（model/metering.py），P2 先留接口——usage_summary()
 返回空统计（调用 0 次、token 0），并在返回值里注明 P3 补齐，不要
 假装有真实用量数据。
+
+P3 补齐：usage_summary() 接上真实数据——通过注入的 metering_reader
+（callable，tenant -> model/metering.summarize 形状的 dict）或
+metering_dir（租户数据目录，<dir>/<tenant>/memory.db 里读 metering
+表，只读打开）读真实汇总；两个都没配时仍返回 P2 的空统计
+（metering="not_available"），数字 0 不代表实际用量。
+注意：标准 compose 部署里网关容器只挂了 docker.sock，没有挂租户
+卷，所以网关进程默认读不到租户库——要让管理接口看到真实用量，
+得把租户数据目录共享给网关（MT_METERING_DIR）或由 agent 侧上报，
+见 gateway/main.py 的说明；没配时不要假装有数。
 """
 import hmac
 import json
@@ -93,12 +103,21 @@ class TenantControl:
 
     def __init__(self, users: dict | None = None, users_file=None,
                  runtime=None, cpu: str | None = None,
-                 memory: str | None = None):
+                 memory: str | None = None, metering_reader=None,
+                 metering_dir=None):
         self.users = users if users is not None else {}
         self.users_file = Path(users_file) if users_file else None
         self.runtime = runtime if runtime is not None else DockerRuntime()
         self.cpu = cpu or os.environ.get("TENANT_CPU", "0.5")
         self.memory = memory or os.environ.get("TENANT_MEMORY", "512m")
+        # P3 计量来源（二选一，不配就是 P2 的空统计）：
+        # metering_reader：callable，tenant -> summarize 形状的 dict；
+        # metering_dir：租户数据目录（<dir>/<tenant>/memory.db，只读）。
+        self.metering_reader = metering_reader
+        self.metering_dir = (Path(metering_dir) if metering_dir
+                             else (Path(os.environ.get("MT_METERING_DIR", ""))
+                                   if os.environ.get("MT_METERING_DIR")
+                                   else None))
 
     # -- 持久化：只改 .env 里 GATEWAY_USERS 这一行 ----------------------
     def _persist_users(self) -> bool:
@@ -212,21 +231,75 @@ class TenantControl:
         return {"tenant": tenant, "cpu": self.cpu, "memory": self.memory,
                 "container_state": state}
 
-    def usage_summary(self, tenant: str) -> dict:
+    def _read_metering_from_dir(self, tenant: str) -> dict | None:
+        """从 metering_dir/<tenant>/memory.db 只读汇总计量。
+
+        没配 metering_dir、库文件不存在、或里面没有 metering 表时
+        返回 None（调用方回落到空统计）。只读打开（mode=ro），
+        绝不建库、不写库。汇总口径和 model/metering.summarize
+        同一份 SQL（COUNT + SUM），不在这里另发明算法。
+        """
+        if self.metering_dir is None:
+            return None
+        db_path = self.metering_dir / tenant / "memory.db"
+        if not db_path.is_file():
+            return None
+        try:
+            import sqlite3
+            from model import metering as metering_mod
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                has_table = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table'"
+                    " AND name = 'metering'").fetchone()
+                if not has_table:
+                    return None
+                return metering_mod.summarize(conn, tenant)
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001 - 计量读不到就回落空统计
+            logger.warning("读租户 %s 的计量失败，回落空统计",
+                           tenant, exc_info=True)
+            return None
+
+    def usage_summary(self, tenant: str, metering=None) -> dict:
         """用量汇总：每租户模型调用/token 用量统计。
 
-        P2 先留接口，返回空统计——model/metering.py 是 P3 才有的模块，
-        现在没有真实用量来源，返回 0 并不代表“没用过”，只是“还没计量”。
-        P3 补齐时这里改成读 model/metering 的统计（调用次数、token、
-        成本估算），返回值字段名不变。
+        数据来源按优先级：本次调用传的 metering（dict 或 callable）
+        > 构造时注入的 metering_reader > metering_dir 只读汇总 >
+        都没有时返回 P2 的空统计（metering="not_available"，数字 0
+        不代表实际用量）。真实数据的 cost_estimate 是 best-effort
+        估算（先留 0.0），不承诺计费级精度。
         """
         if not is_valid_tenant(tenant):
             raise ValueError(f"租户 id 不合法：{tenant!r}")
-        return {"tenant": tenant, "model_calls": 0, "tokens_total": 0,
-                "tokens_input": 0, "tokens_output": 0,
-                "cost_estimate": None, "metering": "not_available",
-                "note": "用量计量是 P3（model/metering.py）才有的模块，"
-                        "P2 先返回空统计，数字 0 不代表实际用量"}
+        summary = None
+        if metering is not None:
+            summary = metering(tenant) if callable(metering) else metering
+        elif self.metering_reader is not None:
+            try:
+                summary = self.metering_reader(tenant)
+            except Exception:  # noqa: BLE001 - 读不到就回落空统计
+                logger.warning("metering_reader 读租户 %s 用量失败",
+                               tenant, exc_info=True)
+                summary = None
+        if summary is None:
+            summary = self._read_metering_from_dir(tenant)
+        if summary is None:
+            return {"tenant": tenant, "model_calls": 0, "tokens_total": 0,
+                    "tokens_input": 0, "tokens_output": 0,
+                    "cost_estimate": None, "metering": "not_available",
+                    "note": "用量计量是 P3（model/metering.py）才有的模块，"
+                            "P2 先返回空统计，数字 0 不代表实际用量"}
+        return {"tenant": tenant,
+                "model_calls": summary.get("model_calls", 0),
+                "tokens_total": summary.get("tokens_total", 0),
+                "tokens_input": summary.get("tokens_input", 0),
+                "tokens_output": summary.get("tokens_output", 0),
+                "cost_estimate": summary.get("cost_estimate"),
+                "metering": "available",
+                "note": "best-effort 估算（token 按文本粗估，成本先留 0.0），"
+                        "不承诺计费级精度"}
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ import os
 from datetime import datetime, timezone
 
 try:
-    from agent.config import API_KEY, SYSTEM_PROMPT, TOOLS_DOC
+    from agent.config import SYSTEM_PROMPT, TOOLS_DOC
     from agent.tenant import tenant_db
     from domain.memory import (
         DEFAULT_CONTEXT_MAX_CHARS,
@@ -21,12 +21,13 @@ try:
         DEFAULT_SUMMARY_THRESHOLD_TURNS,
         estimate_tokens,
     )
+    from model.client import has_api_key
     from store.sqlite_store import SQLiteStore
 except ImportError:  # 以脚本方式运行 python3 agent/app.py 时，项目根目录不在 path 上
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from agent.config import API_KEY, SYSTEM_PROMPT, TOOLS_DOC
+    from agent.config import SYSTEM_PROMPT, TOOLS_DOC
     from agent.tenant import tenant_db
     from domain.memory import (
         DEFAULT_CONTEXT_MAX_CHARS,
@@ -34,6 +35,7 @@ except ImportError:  # 以脚本方式运行 python3 agent/app.py 时，项目�
         DEFAULT_SUMMARY_THRESHOLD_TURNS,
         estimate_tokens,
     )
+    from model.client import has_api_key
     from store.sqlite_store import SQLiteStore
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -59,7 +61,7 @@ def _format_turns(turns) -> str:
 def _summarize_with_llm(llm, turns_text: str) -> str | None:
     """用模型把旧对话浓缩成摘要。没 key / 没模型 / 调用失败都返回 None，
     调用方会改用直接截断旧对话，不会因此报错。"""
-    if llm is None or not API_KEY:
+    if llm is None or not has_api_key():
         return None
     try:
         msg = llm.invoke([
@@ -138,6 +140,13 @@ def assemble_context(tenant: str, llm=None, max_turns=None, max_chars=None,
             old_text = _format_turns(old_turns)
             new_summary = _summarize_with_llm(llm, old_text)
             if new_summary:
+                # P3 计量：摘要也是一次模型调用，记一笔（失败不阻塞组装）。
+                try:
+                    from agent.config import MODEL
+                    store.record_metering(
+                        tenant, MODEL, old_text, new_summary)
+                except Exception:
+                    pass
                 summary = (summary + "\n" + new_summary).strip() if summary \
                     else new_summary
                 store.add_summary(

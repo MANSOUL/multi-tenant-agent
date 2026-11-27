@@ -1,11 +1,13 @@
 """配置：所有环境变量和常量（只读，不含任何逻辑）。
 
 启动：python3 agent/app.py ，网关在前面，见 docker-compose.yml
-环境变量：LLM_BASE_URL / LLM_API_KEY / LLM_MODEL / MAX_TOOL_ROUNDS /
+环境变量：LLM_BASE_URL / LLM_MODEL / MAX_TOOL_ROUNDS /
   CONTEXT_MAX_TURNS / CONTEXT_MAX_CHARS / SUMMARY_THRESHOLD_TURNS /
   PORT / DATA_DIR / TOKEN_SECRET（与网关的 GATEWAY_SECRET 相同）/
   BROWSER_URL / SANDBOX_MODE / SANDBOX_IMAGE / SANDBOX_VOLUME /
   TRUST_TENANT_HEADER / TENANT_ID
+模型密钥（P3 密钥隔离）：只许 model/client.py 从环境变量读，
+本文件不读、不转手，见 model/client.py 和 security/secrets.py。
 依赖：见 agent/requirements.txt（langgraph / langchain-core / langchain-openai）
 
 一租户一容器（2026-11-26 重构）：每个租户单独一个 agent 容器，
@@ -23,7 +25,6 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 TENANT_ID = os.environ.get("TENANT_ID", "").strip()
 SINGLE_TENANT_MODE = bool(TENANT_ID)
 BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-API_KEY = os.environ.get("LLM_API_KEY", "")
 MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "3"))
 # 上下文管理默认值已搬到 domain/memory.py（P0：预算是领域规则，

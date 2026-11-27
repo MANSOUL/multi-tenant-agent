@@ -12,35 +12,28 @@ load_context 只读本租户的库，绝不跨租户；轮数超阈值时把最�
 从最旧一轮开始截，永远保留至少最后一轮；系统提示和最新用户消息不截。
 """
 import re
-from datetime import datetime, timedelta, timezone
 
 try:
     from .tenant import tenant_db
     from context.assembler import assemble_context
-    from domain.memory import estimate_tokens
-    from store.sqlite_store import SQLiteStore
     from domain.reminder import (
         _clean_reminder_text,
-        _now_in_tz,
         due_day_label,
         parse_reminder_time,
-        reminder_tz,
     )
+    from store.sqlite_store import SQLiteStore
 except ImportError:  # 以脚本方式运行 python3 agent/app.py 时，项目根目录不在 path 上
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from tenant import tenant_db
     from context.assembler import assemble_context
-    from domain.memory import estimate_tokens
-    from store.sqlite_store import SQLiteStore
     from domain.reminder import (
         _clean_reminder_text,
-        _now_in_tz,
         due_day_label,
         parse_reminder_time,
-        reminder_tz,
     )
+    from store.sqlite_store import SQLiteStore
 
 
 
@@ -135,33 +128,12 @@ def extract_explicit(text: str, tenant: str, now=None) -> dict:
 def check_due_reminders(tenant: str, now=None) -> list:
     """调度器单次扫描：把到点的 reminders（due_at <= 现在，status=pending）
     置为 due，并往 pending_notifications 写一条未送达记录（同 text+due_at
-    已有未送达记录时不重复写）。返回本轮变 due 的提醒文本列表。"""
-    due_texts = []
-    try:
-        now_dt = _now_in_tz(now)
-        with tenant_db(tenant) as conn:
-            store = SQLiteStore(conn)
-            for rid, rtext, due_at, repeat in store.list_due_candidates():
-                try:
-                    due = datetime.fromisoformat(due_at)
-                except ValueError:
-                    continue
-                if due.tzinfo is None:
-                    due = due.replace(tzinfo=reminder_tz())
-                if due > now_dt:
-                    continue
-                store.mark_reminder_due(rid)
-                store.add_notification_if_absent(tenant, rtext, due_at)
-                due_texts.append(rtext)
-                if repeat == "daily":
-                    # 每天重复：下一天同一时间再提醒一次。
-                    nxt = due + timedelta(days=1)
-                    store.add_reminder(
-                        rtext, {"due_at": nxt.isoformat(),
-                                "repeat": "daily"})
-    except Exception:
-        return due_texts
-    return due_texts
+    已有未送达记录时不重复写）。返回本轮变 due 的提醒文本列表。
+    （P3：实现搬进 app/reminder_service.py 的 ReminderService.scan_due，
+    这里只做薄层转发；调度器和 tests 还调这个函数，签名不变。）"""
+    from app.reminder_service import ReminderService
+
+    return ReminderService().scan_due(tenant, now=now)
 
 
 def mark_notifications_delivered(tenant: str, notification_ids) -> None:

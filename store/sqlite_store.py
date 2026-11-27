@@ -12,7 +12,15 @@ gitignored 的运行时目录（浏览器卷挂载点），且容器里 /app/dat
 """
 import sqlite3
 
-from . import event_log
+from . import event_log, turns as turns_mod
+
+try:
+    from model import metering as metering_mod
+except ImportError:  # 以脚本方式跑时项目根目录在 path 上
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from model import metering as metering_mod
 
 # 建表 SQL：从 agent/tenant.py 的 tenant_db() 原样搬过来，一字不改。
 SCHEMA_STATEMENTS = [
@@ -44,6 +52,21 @@ SCHEMA_STATEMENTS = [
     "CREATE TABLE IF NOT EXISTS compaction_events"
     "(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, archived_count INTEGER,"
     " up_to_ts TEXT)",
+    # P3 计量：每次模型调用一笔（model/metering.py，best-effort 估算，
+    # cost_estimate 先留 0.0，不承诺计费级精度）。
+    "CREATE TABLE IF NOT EXISTS metering"
+    "(id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT, model TEXT,"
+    " ts TEXT, tokens_input INTEGER, tokens_output INTEGER,"
+    " tokens_total INTEGER, cost_estimate REAL)",
+    # P3 Turn 记录：每轮一条（store/turns.py）。
+    "CREATE TABLE IF NOT EXISTS turns"
+    "(id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, tenant TEXT,"
+    " working_dir TEXT, approval_policy TEXT, sandbox_mode TEXT,"
+    " model TEXT, tokens INTEGER, started_at TEXT, ended_at TEXT)",
+    # P3 会话元数据（session/store.py）。
+    "CREATE TABLE IF NOT EXISTS sessions"
+    "(id TEXT PRIMARY KEY, tenant TEXT, status TEXT, summary TEXT,"
+    " created_at TEXT, updated_at TEXT)",
 ]
 
 
@@ -174,11 +197,42 @@ class SQLiteStore:
         return row[0]
 
     # -- reminders -----------------------------------------------------
+    def find_pending_reminder_near(self, text: str, due_at: str | None,
+                                   window_minutes: int = 5):
+        """找同内容、同时间的 pending 提醒：due_at 在 ±window 分钟内的
+        算同一条（P3 去重 bug 修复）。返回 (id, text, due_at, repeat,
+        status)，没有返回 None。due_at 为空时不匹配（歧义提醒不落盘，
+        本来就没有行）。"""
+        from datetime import datetime
+
+        text = (text or "").strip(" ，,。；;、")
+        if not text or not due_at:
+            return None
+        try:
+            target = datetime.fromisoformat(due_at)
+        except ValueError:
+            return None
+        rows = self.conn.execute(
+            "SELECT id, text, due_at, repeat, status FROM reminders"
+            " WHERE text = ? AND status = 'pending' AND due_at IS NOT NULL",
+            (text,)).fetchall()
+        for row in rows:
+            try:
+                due = datetime.fromisoformat(row[2])
+            except ValueError:
+                continue
+            if abs((due - target).total_seconds()) <= window_minutes * 60:
+                return row
+        return None
+
     def add_reminder(self, text: str, parsed: dict) -> bool:
         from datetime import datetime, timezone
 
         text = (text or "").strip(" ，,。；;、")
         if not text:
+            return False
+        # P3 去重：同内容、同时间（±5 分钟）已有一条 pending 就不新建。
+        if self.find_pending_reminder_near(text, parsed.get("due_at")):
             return False
         row = self.conn.execute(
             "SELECT 1 FROM reminders WHERE text = ? AND status = 'pending'"
@@ -278,3 +332,32 @@ class SQLiteStore:
             f" tenant = ? AND id IN ({','.join('?' * len(ids))})",
             [tenant, *ids])
         return rows
+
+    # -- metering（P3，模型调用计量：实现在 model/metering.py，
+    #    这里只委托，和 event_log 的委托方式一样）-----------------------
+    def record_metering(self, tenant: str, model: str, input_text: str = "",
+                        output_text: str = "", cost_estimate: float = 0.0
+                        ) -> int:
+        """记一次模型调用（token 按文本粗估，best-effort；成本先留 0.0）。"""
+        return metering_mod.record_call(
+            self.conn, tenant, model, input_text, output_text,
+            cost_estimate=cost_estimate)
+
+    def metering_summary(self, tenant: str) -> dict:
+        """按租户汇总计量：调用次数、token 合计、成本估算合计。"""
+        return metering_mod.summarize(self.conn, tenant)
+
+    # -- turns（P3，每轮 Turn 记录：实现在 store/turns.py）------------
+    def record_turn(self, session_id: str, tenant: str, working_dir: str = "",
+                    approval_policy: str = "", sandbox_mode: str = "",
+                    model: str = "", tokens: int = 0,
+                    started_at: str | None = None,
+                    ended_at: str | None = None) -> int:
+        """记一轮 Turn，返回行 id。"""
+        return turns_mod.record_turn(
+            self.conn, session_id, tenant, working_dir, approval_policy,
+            sandbox_mode, model, tokens, started_at, ended_at)
+
+    def list_turns(self, tenant: str, limit: int = 20) -> list:
+        """某租户最近的 Turn，按 id 倒序。"""
+        return turns_mod.list_turns(self.conn, tenant, limit)

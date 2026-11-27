@@ -28,18 +28,22 @@ cd ~/workspace/multi-tenant-agent
   `TENANT_ID=demo`、测试密钥、假 `LLM_API_KEY`、`DATA_DIR` 强制指向
   临时目录。
 
-## 覆盖（共 159 项，全过）
+## 覆盖（共 212 项，全过）
 
 | 文件 | 项数 | 覆盖 |
 |---|---|---|
 | `unit/test_reminder_parsing.py` | 33 | 新解析 11 + 新抽取 6 + 旧解析 10 + 旧抽取 6 |
 | `unit/test_reminder_rules.py` | 10 | 顺延/核对 6 + 例子/记忆 3 + TOOLS_DOC 含 update_reminder 1 |
 | `unit/test_event_log.py` | 5 | P0 事件日志：截断归档不删行、二次加载不重复归档、摘要路径、返回结构、归档行可查 |
+| `unit/test_loop.py` | 23 | P3：路由 3 + 循环驱动 6 + 配置 2 + run_graph 2 + 权限 5 + 防线 4 + 密钥隔离 1 |
 | `integration/test_reminder_tools.py` | 33 | 工具 8 + 附加 3 + Bug 4 8 + 旧工具 7 + 旧调度 6 + 调度器线程 1 |
+| `integration/test_reminder_dedup.py` | 6 | P3 bug 2 去重：重复设/±5 分钟内/10 分钟外/不同内容/不同租户/抽取路径 |
+| `integration/test_session.py` | 10 | P3 会话：创建/恢复/fork/归档/只读/默认会话/指定会话 + 图复用 3 |
+| `integration/test_metering_turns.py` | 11 | P3 计量 4 + Turn 2 + 用量汇总接线 3 + 注入标注进系统提示 2 |
 | `integration/test_files.py` | 29 | agent /files/ 19 + 网关 10 |
 | `integration/test_transport.py` | 21 | P1 传输层：路由/错误码结构/静态页/事件/健康/指标/网关（见下） |
 | `integration/test_gateway.py` | 23 | P2 网关拆分：auth token 5 + proxy 透传 2 + digest 比对 3 + control 租户操作 10 + 管理 API 3 |
-| `e2e/test_reminder_dialogue.py` | 5 | 原对话 5 步（假模型走 `chat()` 整条图） |
+| `e2e/test_reminder_dialogue.py` | 8 | 原对话 5 步 + P3 bug 1 澄清直接设 2 步 + 无待澄清时走模型 1 步 |
 
 P0（2026-11-27）新增 `unit/test_event_log.py` 5 项，总数 110 → 115。
 P1（2026-11-27）新增 `integration/test_transport.py` 21 项，总数 115 → 136：
@@ -66,6 +70,28 @@ P2 同时把 `gateway/gateway.py` 拆成 `gateway/{main,edge,infra,control}`，
 两行改成 `import gateway.main`（只改 import 路径，其余不动；main.py
 把 Handler / token_from / ensure_tenant_container 等名字重新导出，
 原有断言不用改）。
+
+P3（2026-11-27）新增 53 项，总数 159 → 212：
+`unit/test_loop.py` 23 项（路由判断 3 + 纯循环驱动 6：多轮正常、
+到上限强制收尾、超时不挂死、钩子被调用、beforeToolCall 拦截、
+模型闪断重试 + 配置 2 + run_graph 2：递归上限透传、超时 +
+权限 5：deny 未知工具、ask 写文件记审计拒绝、ask 跑命令拒绝、
+allow 放行、必填参数缺失 + 防线 4：中文忽略指令命中、假装命中、
+正常聊天不误报、标注含规则名 + 密钥隔离 1：六个目录无 key 读取）；
+`integration/test_reminder_dedup.py` 6 项（bug 2，见上表）；
+`integration/test_session.py` 10 项（会话 7 + 图复用 3）；
+`integration/test_metering_turns.py` 11 项（计量 4 + Turn 2 +
+用量汇总接线 3 + 注入标注进系统提示 2）；
+`e2e/test_reminder_dialogue.py` +3 项（bug 1 澄清直接设 2 项，
+用 BuggyConfirmLLM 模拟“答完上下午又问确认”的旧模型行为；
+无待澄清请求时裸“晚上”走模型 1 项，锁 fail-closed 语义）。
+P3 没有删测试、没有改任何现有测试的断言；唯一动过的现有测试文件
+是 `e2e/test_reminder_dialogue.py`（只追加新类和新用例，原 5 项
+原样不动）。另注意：P3 后图实例按会话复用，`ChatService` 取盐值
+必须每次从 `model.client` 模块上现读 `ChatOpenAI` 再取 id——
+from-import 抓到的名字是旧引用，测试换假模型时盐值不变会导致
+旧图被误复用（本阶段实测踩过：e2e 后两项在全量跑时失败、单独跑
+通过，就是这个原因）。
 
 ## 对账：总数怎么对上 VERIFY.md
 

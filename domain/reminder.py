@@ -6,7 +6,9 @@
 - 提醒状态机：pending（未到点）→ due（已到点，等送达）→ notified
   （已当面提醒过，不再出现）；每天重复的到点后另起一行次日的 pending
 - 去重规则：同一内容 + 同一 due_at 的 pending 提醒不重复写
-  （实现在 store/sqlite_store.py 的 SQL 里，规则本身记在这里）
+  （实现在 store/sqlite_store.py 的 SQL 里，规则本身记在这里）；
+  P3 放宽到时间窗口：同内容、同时间 ±5 分钟内的 pending 提醒算
+  同一条，直接返回已有的那条，不新建（提醒去重 bug 修复）
 
 本模块不碰数据库、不碰网络，只读 REMINDER_TZ 环境变量定提醒时区。
 """

@@ -8,8 +8,11 @@
 observability/metrics.py（/api/metrics 只读 Prometheus 文本）。
 
 只负责 HTTP 层：鉴权（调 tenant.get_tenant）、把消息交给
-graph.chat_with_events()、返回 JSON。业务逻辑（图、工具、记忆、沙箱）
-都在别的模块。
+app/chat_service.chat_with_events()、返回 JSON。业务逻辑（图、工具、
+记忆、沙箱）都在别的模块。会话：请求里可带 session_id（不带时
+用每租户默认会话 "default"），返回里带 session_id；归档会话
+只读，再发消息时按模型失败同款 500 结构返回（ChatService 抛
+RuntimeError，见 do_POST 的异常分支）。
 提醒调度器（2026-11-26）：启动时起一个守护线程，每 30 秒扫一次本租户
 （单租户容器）或 DATA_DIR 下所有租户（老的多租户进程模式）的 reminders，
 到点的写进 pending_notifications 表；下次用户来聊天时，recall_memory
@@ -28,9 +31,9 @@ from urllib.parse import urlparse
 try:
     from .config import DATA_DIR, MODEL, PORT, SINGLE_TENANT_MODE, TENANT_ID
     from .file_server import serve_file
-    from .graph import chat_with_events
     from .memory import check_due_reminders
     from .tenant import get_tenant
+    from app.chat_service import chat_with_events
     from errors.codes import (
         ApiError, bad_request, model_failure, not_found,
         tenant_isolation_violation, unauthenticated,
@@ -43,9 +46,9 @@ except ImportError:  # 以脚本方式运行 python3 agent/app.py 时
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from config import DATA_DIR, MODEL, PORT, SINGLE_TENANT_MODE, TENANT_ID
     from file_server import serve_file
-    from graph import chat_with_events
     from memory import check_due_reminders
     from tenant import get_tenant
+    from app.chat_service import chat_with_events
     from errors.codes import (
         ApiError, bad_request, model_failure, not_found,
         tenant_isolation_violation, unauthenticated,
@@ -185,10 +188,12 @@ class Handler(BaseHTTPRequestHandler):
             text = (payload.get("message") or "").strip()
             if not text:
                 return self._send_error(bad_request("消息是空的"))
-            result = chat_with_events(tenant, text)
+            session_id = payload.get("session_id") or None
+            result = chat_with_events(tenant, text, session_id)
             self._send(200, json.dumps(
                 {"reply": result["reply"], "tenant": tenant,
-                 "events": result["events"]},
+                 "events": result.get("events", []),
+                 "session_id": result.get("session_id", "default")},
                 ensure_ascii=False), "application/json")
         except Exception as e:  # noqa: BLE001 - 模型失败按 500 统一错误结构返回
             if "只服务租户" in str(e):

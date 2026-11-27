@@ -73,6 +73,69 @@ class ScriptedLLM:
         return AIMessage(content="好的。")
 
 
+class BuggyConfirmLLM:
+    """模拟 P3 之前有 bug 的真模型行为：用户答完上下午后不调工具，
+    反而再问一遍“确认一下吗”。P3 的澄清捷径（ChatService 里）
+    应该在模型看到“晚上”之前就直接设好，让这句确认根本没机会出现。
+    第一轮行为和 ScriptedLLM 一样（问上下午）。"""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def bind_tools(self, tools):
+        return self
+
+    def invoke(self, messages):
+        last_human = ""
+        for m in messages:
+            if isinstance(m, HumanMessage):
+                last_human = m.content if isinstance(m.content, str) else ""
+        if "七点二十分提醒我喝水" in last_human:
+            return AIMessage(content="早上七点二十分还是晚上七点二十分？")
+        if "8点提醒我开会" in last_human:
+            return AIMessage(content="早上 8 点还是晚上 8 点？")
+        if last_human.strip() == "晚上":
+            return AIMessage(content="确认一下：晚上提醒你，对吗？")
+        return AIMessage(content="好的。")
+
+
+class _BuggyDialogueCase(unittest.TestCase):
+    def setUp(self):
+        self._ctx = fresh_tenant_data()
+        self._ctx.__enter__()
+        self._llm = mock.patch.object(client_mod, "ChatOpenAI",
+                                      BuggyConfirmLLM)
+        self._llm.start()
+
+    def tearDown(self):
+        self._llm.stop()
+        self._ctx.__exit__(None, None, None)
+
+
+class TestClarificationSetsDirectly(_BuggyDialogueCase):
+    """P3 bug 1：答完上下午还要再确认一次——澄清回答后直接设，
+    不许再问确认（澄清捷径，见 app/chat_service.py）。"""
+
+    def test_evening_answer_sets_1920_without_reconfirm(self):
+        chat("demo", "七点二十分提醒我喝水")
+        reply = chat("demo", "晚上")
+        self.assertIn("19:20", reply)
+        self.assertNotIn("确认", reply)
+        rows = reminder_rows("demo")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], "喝水")
+        self.assertEqual(rows[0][2], _expected_due("晚上7点20分"))
+
+    def test_bare_8_evening_answer_sets_2000_without_reconfirm(self):
+        chat("demo", "8点提醒我开会")
+        reply = chat("demo", "晚上")
+        self.assertIn("20:00", reply)
+        self.assertNotIn("确认", reply)
+        rows = [r for r in reminder_rows("demo") if r[1] == "开会"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][2], _expected_due("晚上8点"))
+
+
 def _expected_due(text):
     """以同一份解析在断言时刻算期望（工具层用真实当前时间，不硬编码日期）。"""
     return parse_reminder_time(text)["due_at"]
@@ -135,3 +198,10 @@ class TestReminderDialogue(_DialogueCase):
         rows = [r for r in reminder_rows("demo") if r[1] == "开会"]
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][2], _expected_due("晚上8点"))
+
+    def test_bare_evening_without_pending_goes_to_model(self):
+        # 澄清捷径是 fail-closed 的：没有待澄清的提醒请求时，
+        # 裸“晚上”不设提醒、不猜，走正常模型路径。
+        reply = chat("demo", "晚上")
+        self.assertEqual(reply, "好的。")
+        self.assertEqual(reminder_rows("demo"), [])
