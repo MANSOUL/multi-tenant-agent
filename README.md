@@ -288,8 +288,9 @@ demo 租户的工作区，但用户在浏览器里打不开——agent 和网关
   原样发。`.db` / `.sqlite` / `.env`、点开头文件一律打不开（403）——
   记忆库和 key 不会从这个口子漏出去。
 - **实现位置**：`agent/server.py` 的 `_serve_file()`（鉴权 + `safe_path`
-  锁目录 + 后缀白名单 + 按字节读），`gateway/gateway.py` 的 `do_GET`
-  把 `/files/` 交给现有的 `_proxy()`，并原样透传上游 Content-Type
+  锁目录 + 后缀白名单 + 按字节读），网关的 `do_GET`
+  把 `/files/` 交给现有的代理（`gateway/main.py` 的 `Handler._proxy` →
+  `gateway/edge/proxy.py` 的 `proxy_request`），并原样透传上游 Content-Type
   （以前一律套 json 头，图片会被标错）。
 
 ## 快速开始
@@ -324,7 +325,7 @@ PORT=8081 DATA_DIR=./data TENANT_ID=demo .venv/bin/python agent/app.py
 
 | 服务 | 镜像/构建 | 端口 | 说明 |
 |---|---|---|---|
-| gateway | `gateway/Dockerfile`（python:3.12-slim，标准库 + docker CLI） | 8080（唯一对外端口） | 登录 + 发 token + 租户容器管理（run/start/stop/闲置回收）+ 按租户反向代理 |
+| gateway | `gateway/Dockerfile`（python:3.12-slim，标准库 + docker CLI） | 8080（唯一对外端口）；管理 API 另监听 127.0.0.1:8082（只限回环，需 `GATEWAY_ADMIN_TOKEN`） | 登录 + 发 token + 租户容器管理（run/start/stop/闲置回收/镜像 digest 变了自动重建）+ 按租户反向代理 + 租户开通/删除/改密码/配额（管理面，见 `gateway/control/tenants.py`） |
 | mt-tenant-\<租户\> | 根目录 `Dockerfile`（python:3.12-slim，装 `agent/requirements.txt`：langgraph 等） | 8081（仅容器内网，不对外发布） | 每个租户一个：LangGraph 图编排、工具、记忆、沙箱、调浏览器服务；数据在卷 `mt-data-<租户>` 里；由网关按需起停，不在 compose 里 |
 | browser | `browser/Dockerfile`（Playwright Python 镜像） | 8001（仅容器内网） | Chromium 无头浏览：打开页面、取标题/正文、截图；**所有租户先共用一个**，后续可按租户拆（截图落盘问题见架构图下的表） |
 | postgres | `postgres:16-alpine` | 不发布 | 可选（`--profile optional` 才起）。当前版本 agent 不依赖它，留给以后做共享元数据/计量 |

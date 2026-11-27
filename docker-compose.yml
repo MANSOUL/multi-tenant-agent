@@ -27,6 +27,11 @@ services:
       - TENANT_CPU=${TENANT_CPU:-0.5}
       - TENANT_MEMORY=${TENANT_MEMORY:-512m}
       - TENANT_IDLE_MINUTES=${TENANT_IDLE_MINUTES:-30}
+      # P2 管理面（只对内）：管理 API 单独监听 127.0.0.1:8082，不发布
+      # 端口，只能 docker exec 进容器调；GATEWAY_ADMIN_TOKEN 不设则
+      # 管理接口拒绝服务（不启动监听）。ADMIN_PORT 一般不用改。
+      - ADMIN_PORT=8082
+      - GATEWAY_ADMIN_TOKEN=${GATEWAY_ADMIN_TOKEN:-}
     ports:
       # 唯一对外端口，只放局域网，不要映射到公网
       - "8080:8080"

@@ -28,7 +28,7 @@ cd ~/workspace/multi-tenant-agent
   `TENANT_ID=demo`、测试密钥、假 `LLM_API_KEY`、`DATA_DIR` 强制指向
   临时目录。
 
-## 覆盖（共 136 项，全过）
+## 覆盖（共 159 项，全过）
 
 | 文件 | 项数 | 覆盖 |
 |---|---|---|
@@ -38,6 +38,7 @@ cd ~/workspace/multi-tenant-agent
 | `integration/test_reminder_tools.py` | 33 | 工具 8 + 附加 3 + Bug 4 8 + 旧工具 7 + 旧调度 6 + 调度器线程 1 |
 | `integration/test_files.py` | 29 | agent /files/ 19 + 网关 10 |
 | `integration/test_transport.py` | 21 | P1 传输层：路由/错误码结构/静态页/事件/健康/指标/网关（见下） |
+| `integration/test_gateway.py` | 23 | P2 网关拆分：auth token 5 + proxy 透传 2 + digest 比对 3 + control 租户操作 10 + 管理 API 3 |
 | `e2e/test_reminder_dialogue.py` | 5 | 原对话 5 步（假模型走 `chat()` 整条图） |
 
 P0（2026-11-27）新增 `unit/test_event_log.py` 5 项，总数 110 → 115。
@@ -50,6 +51,21 @@ P1（2026-11-27）新增 `integration/test_transport.py` 21 项，总数 115 →
 _proxy 未登录 401 结构）。
 另注意：P1 后 e2e 的假模型贴在 `model.client.ChatOpenAI` 上
 （原来贴在 `agent.graph.ChatOpenAI`，模型创建已收进 model 层）。
+
+P2（2026-11-27）新增 `integration/test_gateway.py` 23 项，总数 136 → 159：
+auth token 校验 5 项（签发/校验往返、过期拒绝、篡改拒绝、cookie、
+Bearer）、proxy 透传 2 项（html/png 的 Content-Type 原样透传）、
+digest 比对 3 项（相同不重建、不同重建、docker 不可用时 fail-open
+登录照样成功且不删容器）、control 租户操作 10 项（开通指定密码/
+生成密码/重复拒绝/id 不合法拒绝、删除须显式确认/确认后停容器删容器
+删卷、改密码/改不存在的租户、配额、用量汇总空统计）、管理 API 3 项
+（缺 token 401、错 token 401、对 token 列出/开通/删除流程、
+未配 GATEWAY_ADMIN_TOKEN 时拒绝服务不启动监听）。
+P2 同时把 `gateway/gateway.py` 拆成 `gateway/{main,edge,infra,control}`，
+`test_files.py` 与 `test_transport.py` 里 `import gateway.gateway` 的
+两行改成 `import gateway.main`（只改 import 路径，其余不动；main.py
+把 Handler / token_from / ensure_tenant_container 等名字重新导出，
+原有断言不用改）。
 
 ## 对账：总数怎么对上 VERIFY.md
 

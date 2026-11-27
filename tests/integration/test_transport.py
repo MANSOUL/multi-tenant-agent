@@ -25,7 +25,7 @@ from agent.graph import collect_events
 import agent.server as server_mod
 import agent.tenant as tenant_mod
 from errors.codes import ApiError, ErrorCategory, error_body
-import gateway.gateway as gateway_mod
+import gateway.main as gateway_mod
 from observability import metrics as obs_metrics
 
 

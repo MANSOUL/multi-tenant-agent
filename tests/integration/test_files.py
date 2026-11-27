@@ -18,7 +18,7 @@ from unittest import mock
 from tests.helpers import TEST_SECRET, fresh_tenant_data, make_token
 import agent.server as server_mod
 import agent.tenant as tenant_mod
-import gateway.gateway as gateway_mod
+import gateway.main as gateway_mod
 
 HTML = b"<!DOCTYPE html><html><body>calc</body></html>"
 CSS = b"body { color: red; }"
