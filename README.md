@@ -1,4 +1,4 @@
-# 多租户 Agent · 单机 + Docker 原型
+# Kapi · 单机 + Docker 原型
 
 > 由 `~/workspace/pi-agent-starter/`（单租户）改来，2026-11-26 建。
 > 目标：单机 + Docker 上每个租户一台隔离的“虚拟电脑”。

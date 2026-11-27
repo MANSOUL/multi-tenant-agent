@@ -1,6 +1,6 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>多租户 Agent</title><style>
+<title>Kapi</title><style>
 :root{
   --bg:#f6f7f9; --surface:#ffffff; --surface-2:#f0f2f5; --text:#1a1d21; --muted:#6b7280;
   --border:#e3e6ea; --accent:#2563eb; --accent-hover:#1d4ed8; --accent-text:#ffffff;
@@ -55,8 +55,8 @@ button.primary:hover{background:var(--accent-hover)}
 .note{font-size:13px;color:var(--muted);padding:10px 16px 0}
 </style></head><body>
 <div class="app">
-  <header><div class="title">多租户 Agent</div><div class="spacer"></div><span class="chip">租户容器直连</span></header>
-  <p class="note">请通过网关登录（http://宿主机:8080），登录后你的租户 id 会显示在这里。本页靠登录 cookie 认身份，未登录时发消息会提示重新登录。</p>
+  <header><div class="title">Kapi</div><div class="spacer"></div></header>
+  <p class="note">请通过网关登录（http://宿主机:8080）。本页靠登录 cookie 认身份，未登录时发消息会提示重新登录。</p>
   <div id="log"></div>
   <form id="composer" onsubmit="send(event)"><input id="q" autocomplete="off" placeholder="跟助手说点什么…"><button class="primary" type="submit">发送</button></form>
 </div>
@@ -124,7 +124,7 @@ function usageText(u){ if(!u) return '';
  if(u.reasoning_tokens) s+='（思考 '+fmtNum(u.reasoning_tokens)+'）';
  s+=' · 合计 '+fmtNum(u.total_tokens);
  if(u.cost_usd!=null) s+=' · 约 $'+Number(u.cost_usd).toFixed(4);
- if(u.tenant_usage){ const t=u.tenant_usage; s+=' ｜ 本租户累计 '+fmtNum(t.tokens_total)+' tokens'; if(t.cost_estimate!=null) s+=' · 约 $'+Number(t.cost_estimate).toFixed(4); }
+ if(u.tenant_usage){ const t=u.tenant_usage; s+=' ｜ 累计 '+fmtNum(t.tokens_total)+' tokens'; if(t.cost_estimate!=null) s+=' · 约 $'+Number(t.cost_estimate).toFixed(4); }
  return s; }
 function showUsage(wrap, u){ const t=usageText(u); if(!t) return;
  let el=wrap.querySelector('.usage'); if(!el){ el=document.createElement('div'); el.className='usage'; wrap.appendChild(el); }

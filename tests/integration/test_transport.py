@@ -85,7 +85,7 @@ class TestTransportHttp(unittest.TestCase):
         #（d.error.message，见 agent/web/chat.html 的注释级改动）。
         page = (Path(server_mod.__file__).parent / "web" / "chat.html"
                 ).read_text(encoding="utf-8")
-        self.assertIn("<title>多租户 Agent</title>", page)
+        self.assertIn("<title>Kapi</title>", page)
         self.assertIn("linkify", page)
         self.assertIn("[/]files[/]", page)
         self.assertIn('id="q"', page)
@@ -97,7 +97,7 @@ class TestTransportHttp(unittest.TestCase):
     def test_login_html_file_has_original_content(self):
         page = (Path(gateway_mod.__file__).parent / "web" / "login.html"
                 ).read_text(encoding="utf-8")
-        self.assertIn("<title>登录 · 多租户 Agent</title>", page)
+        self.assertIn("<title>登录 · Kapi</title>", page)
         self.assertIn("linkify", page)
         self.assertIn("[/]files[/]", page)
         self.assertIn("mt_token", page)
