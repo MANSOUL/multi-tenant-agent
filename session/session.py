@@ -15,12 +15,14 @@ import threading
 
 try:
     from agent.tenant import tenant_db
+    from store import create_store
     from . import store as session_store
 except ImportError:  # 以脚本方式跑时项目根目录在 path 上
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from agent.tenant import tenant_db
+    from store import create_store
     from session import store as session_store
 
 DEFAULT_SESSION_ID = "default"
@@ -32,7 +34,8 @@ def new_session_id() -> str:
 
 
 class SessionManager:
-    """会话管理器：元数据走 session/store.py（SQLite sessions 表），
+    """会话管理器：元数据走 session/store.py（转调 store/ 仓储，
+    后端按 STORE_BACKEND 切），
     图实例缓存在内存里（进程内，丢了就重建——图本身无状态，记忆
     在库里，重建不丢东西）。"""
 
@@ -46,39 +49,43 @@ class SessionManager:
         """恢复会话：id 为空时用默认会话；没有就新建。返回会话 dict。"""
         sid = session_id or DEFAULT_SESSION_ID
         with tenant_db(tenant) as conn:
-            session = session_store.get_session(conn, sid)
+            store = create_store(conn)
+            session = session_store.get_session(store, sid)
             if session is None:
-                session = session_store.create_session(conn, sid, tenant)
+                session = session_store.create_session(store, sid, tenant)
         return session
 
     def get_session(self, tenant: str, session_id: str) -> dict | None:
         """只读会话，没有返回 None（不新建）。"""
         with tenant_db(tenant) as conn:
-            return session_store.get_session(conn, session_id)
+            return session_store.get_session(
+                create_store(conn), session_id)
 
     def create_session(self, tenant: str) -> dict:
         """新建一个会话（随机 id），返回会话 dict。"""
         with tenant_db(tenant) as conn:
             return session_store.create_session(
-                conn, new_session_id(), tenant)
+                create_store(conn), new_session_id(), tenant)
 
     def fork_session(self, tenant: str, session_id: str) -> dict:
         """fork 会话：新 id，复制源会话的历史摘要；事实是租户级的，
         新会话引用同一份 facts 表，不复制全文。源会话不存在抛 KeyError。"""
         with tenant_db(tenant) as conn:
-            src = session_store.get_session(conn, session_id)
+            store = create_store(conn)
+            src = session_store.get_session(store, session_id)
             if src is None:
                 raise KeyError(session_id)
             if src["tenant"] != tenant:
                 raise KeyError(session_id)
             return session_store.create_session(
-                conn, new_session_id(), tenant, summary=src["summary"] or "")
+                store, new_session_id(), tenant, summary=src["summary"] or "")
 
     def archive_session(self, tenant: str, session_id: str) -> bool:
         """归档会话：状态翻成 archived，之后只读。返回是否真的改了一条。
         归档不删图缓存里的图实例（图无状态，重建也一样），只挡新请求。"""
         with tenant_db(tenant) as conn:
-            return session_store.archive_session(conn, session_id)
+            return session_store.archive_session(
+                create_store(conn), session_id)
 
     def is_archived(self, tenant: str, session_id: str) -> bool:
         """该会话是不是已归档（只读）。"""

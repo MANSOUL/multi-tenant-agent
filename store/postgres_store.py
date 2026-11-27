@@ -22,22 +22,21 @@ pending_notifications / chat_archived / compaction_events +
 P3 的三张新表 metering / turns / sessions（和 SQLite 版同字段，
 只换自增写法）。
 
-接线状态（诚实说明，见文末“未接线”）：
+接线状态（2026-11-27 已接完，服务器验证见下）：
 - STORE_BACKEND 环境变量切换在 store/__init__.py 的 create_store：
   sqlite（默认）→ SQLiteStore，postgres → PostgresStore；
   传错连接（postgres 后端配了个 SQLite 连接）直接 ValueError。
 - connect() 只连库：psycopg2 是懒 import，没装时报清楚的
   RuntimeError（本地 mtvenv 没装 psycopg2，真库验证在服务器上
   用 mt-postgres 容器做）；DSN 从 POSTGRES_DSN 环境变量读。
-- 未接线（服务器验证前要补，见汇报）：agent/tenant.py 的
-  tenant_db() 现在还是只开 SQLite——它一旦按 STORE_BACKEND
-  切到 Postgres，调用方里直接写 SQLite 方言的 7 处 SQL 也要改
+- agent/tenant.py 的 tenant_db() 已按 STORE_BACKEND 切后端；
+  原来直接写 SQLite 方言的 10 处 SQL 已全部改成走仓储接口
   （session/store.py 5 处、app/reminder_service.py 1 处、
-  tools/definitions/memory.py 的 INSERT OR REPLACE 1 处），
-  还有 gateway/control/tenants.py 的用量汇总是直接读 SQLite
-  文件的。create_store 的调用点已经全换过去了（agent/memory.py、
-  app/*、context/assembler.py、tools/definitions/memory.py、
-  infra/graph.py），sqlite 默认下行为一字不改。
+  tools/definitions/memory.py 1 处、model/metering.py 的 3 处
+  本就由 SQLiteStore 委托、PostgresStore 自有方言实现）。
+  只有一处例外：gateway/control/tenants.py 的用量汇总是直接读
+  SQLite 文件的（网关镜像里没有 psycopg2），postgres 后端下
+  它返回 metering="not_available"，不谎报数字。
 """
 import os
 import re
@@ -139,8 +138,8 @@ class PostgresStore:
     的 Postgres 方言直译（同一接口、同一返回形状）。
 
     约定和 SQLiteStore 一样：调用方负责提交/关闭；本类不自己
-    提交、不自己关闭。会话（sessions 表）只有建表，没有方法——
-    session/store.py 现在还只会 SQLite 方言，见模块头“未接线”。
+    提交、不自己关闭。会话（sessions 表）的方法在文件末尾，
+    2026-11-27 已接线（原 session/store.py 的 SQL 搬进来）。
     """
 
     def __init__(self, conn):
@@ -166,6 +165,17 @@ class PostgresStore:
             " updated_at = EXCLUDED.updated_at",
             (key, value, datetime.now(timezone.utc).isoformat()))
         return True
+
+    def remember_fact(self, key: str, value: str) -> None:
+        """facts 直写（按 key 覆盖）：给 remember_fact 工具用。"""
+        from datetime import datetime, timezone
+
+        _execute(
+            self.conn,
+            "INSERT INTO facts (key, value, updated_at) VALUES (%s, %s, %s)"
+            " ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value,"
+            " updated_at = EXCLUDED.updated_at",
+            (key, value, datetime.now(timezone.utc).isoformat()))
 
     def get_facts(self):
         return _execute(
@@ -442,6 +452,17 @@ class PostgresStore:
             "SELECT id, text, due_at FROM pending_notifications"
             " WHERE delivered = 0 ORDER BY id ASC").fetchall()
 
+    def invalidate_notifications(self, tenant: str, text: str) -> None:
+        """把某条提醒之前到点产生的未送达通知作废，避免旧时间再冒出来。
+
+        原 app/reminder_service.py 里直接拼的 UPDATE，2026-11-27 接线
+        到仓储（改提醒时间时调这个）。"""
+        _execute(
+            self.conn,
+            "UPDATE pending_notifications SET delivered = 1"
+            " WHERE tenant = %s AND text = %s AND delivered = 0",
+            (tenant, text))
+
     def mark_notifications_delivered(self, tenant: str, ids):
         ids = [i for i in (ids or []) if isinstance(i, int)]
         if not ids:
@@ -526,3 +547,66 @@ class PostgresStore:
             " sandbox_mode, model, tokens, started_at, ended_at FROM turns"
             " WHERE tenant = %s ORDER BY id DESC LIMIT %s",
             (tenant, limit)).fetchall()
+    # -- sessions（P3 会话元数据：原 session/store.py 的 5 条 SQL，
+    #    2026-11-27 接线到仓储，%s 方言，调用方不再拼 SQL）----------
+    def create_session(self, session_id: str, tenant: str,
+                       summary: str = "") -> dict:
+        """新建会话（已存在时不覆盖，返回已有的那条）。"""
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).isoformat()
+        _execute(
+            self.conn,
+            "INSERT INTO sessions"
+            " (id, tenant, status, summary, created_at, updated_at)"
+            " VALUES (%s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT (id) DO NOTHING",
+            (session_id, tenant, "active", summary, now, now))
+        return self.get_session(session_id)
+
+    def get_session(self, session_id: str) -> dict | None:
+        """按 id 取会话，没有返回 None。"""
+        row = _execute(
+            self.conn,
+            "SELECT id, tenant, status, summary, created_at, updated_at"
+            " FROM sessions WHERE id = %s",
+            (session_id,)).fetchone()
+        if row is None:
+            return None
+        return {"id": row[0], "tenant": row[1], "status": row[2],
+                "summary": row[3], "created_at": row[4],
+                "updated_at": row[5]}
+
+    def list_sessions(self, tenant: str) -> list:
+        """某租户的全部会话，按创建时间升序。"""
+        rows = _execute(
+            self.conn,
+            "SELECT id, tenant, status, summary, created_at, updated_at"
+            " FROM sessions WHERE tenant = %s ORDER BY created_at ASC",
+            (tenant,)).fetchall()
+        return [{"id": r[0], "tenant": r[1], "status": r[2],
+                 "summary": r[3], "created_at": r[4],
+                 "updated_at": r[5]} for r in rows]
+
+    def update_session_summary(self, session_id: str, summary: str) -> None:
+        """更新会话的历史摘要（fork 时复制摘要就调这个）。"""
+        from datetime import datetime, timezone
+
+        _execute(
+            self.conn,
+            "UPDATE sessions SET summary = %s, updated_at = %s"
+            " WHERE id = %s",
+            (summary, datetime.now(timezone.utc).isoformat(), session_id))
+
+    def archive_session(self, session_id: str) -> bool:
+        """归档会话：状态翻成 archived。返回是否真的改了一条。"""
+        from datetime import datetime, timezone
+
+        cur = _execute(
+            self.conn,
+            "UPDATE sessions SET status = %s, updated_at = %s"
+            " WHERE id = %s AND status = %s",
+            ("archived", datetime.now(timezone.utc).isoformat(),
+             session_id, "active"))
+        return cur.rowcount > 0
+

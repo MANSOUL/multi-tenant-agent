@@ -46,9 +46,25 @@ def tenant_dirs(tenant: str) -> tuple[Path, Path, Path]:
 
 
 def tenant_db(tenant: str):
-    """打开本租户的库并建表。建表 SQL 在 store/sqlite_store.py，
-    这里只调它，不再自己拼 CREATE TABLE。"""
+    """打开本租户的库并建表。建表 SQL 在 store/，这里只调它，
+    不再自己拼 CREATE TABLE。
+
+    后端按 STORE_BACKEND 切（2026-11-27 接线）：sqlite（默认）还是
+    老路子——每租户一个 memory.db 文件；postgres 时连 POSTGRES_DSN
+    的库，在 "tenant" 同名的 schema 里建表（租户隔离靠 schema），
+    每次调用都是新连接、search_path 只对这个连接生效。两种连接
+    都支持 `with ... as conn:`（退出时提交），调用方不用区分。
+    """
     _, db_path, _ = tenant_dirs(tenant)
+    from store import backend_name
+
+    if backend_name() == "postgres":
+        from store.postgres_store import connect as pg_connect
+        from store.postgres_store import ensure_schema as pg_ensure_schema
+
+        conn = pg_connect()
+        pg_ensure_schema(conn, schema=tenant)
+        return conn
     conn = sqlite3.connect(db_path)
     ensure_schema(conn)
     return conn

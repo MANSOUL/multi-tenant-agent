@@ -6,7 +6,6 @@ list_facts / search_facts。
 tools/registry.py 拼出来的 LangChain 工具）。
 """
 import inspect
-from datetime import datetime, timezone
 
 try:
     from agent.tenant import tenant_db
@@ -24,10 +23,7 @@ def specs(tenant: str) -> list:
 
     def _remember(args):
         with tenant_db(tenant) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO facts VALUES (?, ?, ?)",
-                (args["key"], args["value"],
-                 datetime.now(timezone.utc).isoformat()))
+            create_store(conn).remember_fact(args["key"], args["value"])
         return f"记住了：{args['key']} = {args['value']}"
 
     def _recall(args):

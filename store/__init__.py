@@ -8,8 +8,8 @@ STORE_BACKEND 切换（P4）：create_store(conn) 按环境变量选实现，
 sqlite（默认）→ SQLiteStore，postgres → PostgresStore；连接和
 后端必须匹配（postgres 后端配了个 SQLite 连接直接 ValueError，
 不静默跑错方言）。tenant_db() 目前还是只开 SQLite（见
-store/postgres_store.py 模块头的“未接线”说明），所以生产默认
-行为不变；服务器上验证 Postgres 时再接 tenant_db 那一头。
+tenant_db() 已按 STORE_BACKEND 切后端（见 agent/tenant.py），
+所以生产默认行为不变；服务器上验证 Postgres 时再跑真库。
 
 注意：包名是 store/ 而不是 ARCHITECTURE.md 写的 data/，原因见
 store/sqlite_store.py 顶部注释（项目根目录的 data/ 是 gitignored 的

@@ -14,6 +14,7 @@ from app.chat_service import ChatService
 from infra.graph import build_graph
 from langchain_core.messages import AIMessage
 from session.session import SessionManager
+from store import create_store
 from session.store import update_summary
 
 
@@ -59,7 +60,8 @@ class TestSessionLifecycle(_SessionCase):
     def test_fork_copies_summary_not_full_history(self):
         src = self.manager.create_session("demo")
         with tenant_db("demo") as conn:
-            update_summary(conn, src["id"], "摘要：用户喜欢喝水")
+            update_summary(create_store(conn), src["id"],
+                           "摘要：用户喜欢喝水")
         forked = self.manager.fork_session("demo", src["id"])
         self.assertNotEqual(forked["id"], src["id"])
         self.assertEqual(forked["summary"], "摘要：用户喜欢喝水")

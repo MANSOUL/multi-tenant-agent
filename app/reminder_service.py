@@ -155,10 +155,7 @@ class ReminderService:
             store.update_reminder(rid, parsed["due_at"],
                                   parsed.get("repeat", "once"))
             # 这条提醒之前到点产生的未送达通知作废，避免旧时间再冒出来。
-            conn.execute(
-                "UPDATE pending_notifications SET delivered = 1"
-                " WHERE tenant = ? AND text = ? AND delivered = 0",
-                (tenant, old_text))
+            store.invalidate_notifications(tenant, old_text)
         when = parsed["due_at"].replace("T", " ").split("+")[0]
         return (f"已把提醒「{old_text}」改成 {when}"
                 f"（{due_day_label(parsed['due_at'])}，"

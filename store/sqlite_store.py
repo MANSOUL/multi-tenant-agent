@@ -110,6 +110,18 @@ class SQLiteStore:
             (key, value, datetime.now(timezone.utc).isoformat()))
         return True
 
+    def remember_fact(self, key: str, value: str) -> None:
+        """facts 直写（按 key 覆盖）：给 remember_fact 工具用。
+
+        和 remember_fact_once 的区别：这个不按 value 去重，同一 key
+        反复记就反复覆盖——工具的语义就是“记住了：k = v”。
+        """
+        from datetime import datetime, timezone
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO facts VALUES (?, ?, ?)",
+            (key, value, datetime.now(timezone.utc).isoformat()))
+
     def get_facts(self):
         return self.conn.execute(
             "SELECT key, value FROM facts").fetchall()
@@ -319,6 +331,16 @@ class SQLiteStore:
             "SELECT id, text, due_at FROM pending_notifications"
             " WHERE delivered = 0 ORDER BY id ASC").fetchall()
 
+    def invalidate_notifications(self, tenant: str, text: str) -> None:
+        """把某条提醒之前到点产生的未送达通知作废，避免旧时间再冒出来。
+
+        原 app/reminder_service.py 里直接拼的 UPDATE，2026-11-27 接线
+        到仓储（改提醒时间时调这个）。"""
+        self.conn.execute(
+            "UPDATE pending_notifications SET delivered = 1"
+            " WHERE tenant = ? AND text = ? AND delivered = 0",
+            (tenant, text))
+
     def mark_notifications_delivered(self, tenant: str, ids):
         ids = [i for i in (ids or []) if isinstance(i, int)]
         if not ids:
@@ -361,3 +383,58 @@ class SQLiteStore:
     def list_turns(self, tenant: str, limit: int = 20) -> list:
         """某租户最近的 Turn，按 id 倒序。"""
         return turns_mod.list_turns(self.conn, tenant, limit)
+
+    # -- sessions（P3 会话元数据：原 session/store.py 的 5 条 SQL，
+    #    2026-11-27 接线到仓储，方言留在这里，调用方不再拼 SQL）----
+    def create_session(self, session_id: str, tenant: str,
+                       summary: str = "") -> dict:
+        """新建会话（已存在时不覆盖，返回已有的那条）。"""
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sessions"
+            " (id, tenant, status, summary, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, tenant, "active", summary, now, now))
+        return self.get_session(session_id)
+
+    def get_session(self, session_id: str) -> dict | None:
+        """按 id 取会话，没有返回 None。"""
+        row = self.conn.execute(
+            "SELECT id, tenant, status, summary, created_at, updated_at"
+            " FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        if row is None:
+            return None
+        return {"id": row[0], "tenant": row[1], "status": row[2],
+                "summary": row[3], "created_at": row[4],
+                "updated_at": row[5]}
+
+    def list_sessions(self, tenant: str) -> list:
+        """某租户的全部会话，按创建时间升序。"""
+        rows = self.conn.execute(
+            "SELECT id, tenant, status, summary, created_at, updated_at"
+            " FROM sessions WHERE tenant = ? ORDER BY created_at ASC",
+            (tenant,)).fetchall()
+        return [{"id": r[0], "tenant": r[1], "status": r[2],
+                 "summary": r[3], "created_at": r[4],
+                 "updated_at": r[5]} for r in rows]
+
+    def update_session_summary(self, session_id: str, summary: str) -> None:
+        """更新会话的历史摘要（fork 时复制摘要就调这个）。"""
+        from datetime import datetime, timezone
+
+        self.conn.execute(
+            "UPDATE sessions SET summary = ?, updated_at = ? WHERE id = ?",
+            (summary, datetime.now(timezone.utc).isoformat(), session_id))
+
+    def archive_session(self, session_id: str) -> bool:
+        """归档会话：状态翻成 archived。返回是否真的改了一条。"""
+        from datetime import datetime, timezone
+
+        cur = self.conn.execute(
+            "UPDATE sessions SET status = ?, updated_at = ?"
+            " WHERE id = ? AND status = ?",
+            ("archived", datetime.now(timezone.utc).isoformat(),
+             session_id, "active"))
+        return cur.rowcount > 0
