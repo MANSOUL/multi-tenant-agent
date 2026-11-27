@@ -26,11 +26,10 @@ BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/
 API_KEY = os.environ.get("LLM_API_KEY", "")
 MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "3"))
-# 上下文管理默认值（每次调用 load_context 时重新读环境变量，
-# 这样测试可以用小阈值验证，不用重启进程；生产默认值见 .env.example）
-DEFAULT_CONTEXT_MAX_TURNS = 10
-DEFAULT_CONTEXT_MAX_CHARS = 12000
-DEFAULT_SUMMARY_THRESHOLD_TURNS = 20
+# 上下文管理默认值已搬到 domain/memory.py（P0：预算是领域规则，
+# 不属于配置层）；环境变量 CONTEXT_MAX_TURNS / CONTEXT_MAX_CHARS /
+# SUMMARY_THRESHOLD_TURNS 仍在每次组装上下文时重读，测试可用小阈值验证，
+# 不用重启进程；生产默认值见 .env.example。
 TOKEN_SECRET = os.environ.get("TOKEN_SECRET", "") or os.environ.get(
     "GATEWAY_SECRET", ""
 )

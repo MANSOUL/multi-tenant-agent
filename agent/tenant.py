@@ -12,8 +12,13 @@ from pathlib import Path
 
 try:
     from .config import DATA_DIR, TENANT_ID, TOKEN_SECRET, TRUST_TENANT_HEADER
-except ImportError:  # 以脚本方式运行 python3 agent/app.py 时
+    from store.sqlite_store import ensure_schema
+except ImportError:  # 以脚本方式运行 python3 agent/app.py 时，项目根目录不在 path 上
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from config import DATA_DIR, TENANT_ID, TOKEN_SECRET, TRUST_TENANT_HEADER
+    from store.sqlite_store import ensure_schema
 
 # 租户 id 只允许字母数字 _ - ，防止路径穿越和奇怪的租户名
 TENANT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -41,41 +46,11 @@ def tenant_dirs(tenant: str) -> tuple[Path, Path, Path]:
 
 
 def tenant_db(tenant: str):
+    """打开本租户的库并建表。建表 SQL 在 store/sqlite_store.py，
+    这里只调它，不再自己拼 CREATE TABLE。"""
     _, db_path, _ = tenant_dirs(tenant)
     conn = sqlite3.connect(db_path)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS facts"
-        "(key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)"
-    )
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS chat_log"
-        "(ts TEXT, role TEXT, content TEXT)"
-    )
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS summaries"
-        "(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, summary TEXT,"
-        " up_to_ts TEXT)"
-    )
-    # 待办与提醒（2026-11-26 提醒/记忆改进）：每租户独立的表，和 facts 一样
-    # 只属于本租户。reminders.status：pending（未到点）/ due（已到点，等送达）/
-    # notified（已当面提醒过，不再出现）。歧义时间（裸“8点”没说上下午）
-    # 不落盘，due_at 为空的行只可能是历史遗留，调度器会跳过它。
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS todos"
-        "(id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT, status TEXT,"
-        " created_at TEXT)"
-    )
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS reminders"
-        "(id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT, due_at TEXT,"
-        " repeat TEXT, status TEXT, created_at TEXT)"
-    )
-    # 调度器到点后写的待送达提醒：delivered=0 表示还没在聊天里当面告诉用户。
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS pending_notifications"
-        "(id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT, text TEXT,"
-        " due_at TEXT, created_at TEXT, delivered INTEGER DEFAULT 0)"
-    )
+    ensure_schema(conn)
     return conn
 
 

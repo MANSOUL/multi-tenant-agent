@@ -15,7 +15,7 @@ from unittest import mock
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from tests.helpers import fresh_tenant_data, reminder_rows
-import agent.graph as graph_mod
+import model.client as client_mod
 from agent.graph import chat
 from agent.memory import parse_reminder_time
 from agent.tools import make_tools
@@ -82,7 +82,8 @@ class _DialogueCase(unittest.TestCase):
     def setUp(self):
         self._ctx = fresh_tenant_data()
         self._ctx.__enter__()
-        self._llm = mock.patch.object(graph_mod, "ChatOpenAI", ScriptedLLM)
+        # P0 后模型创建收进 model/client.py，假模型贴在新的缝上。
+        self._llm = mock.patch.object(client_mod, "ChatOpenAI", ScriptedLLM)
         self._llm.start()
 
     def tearDown(self):

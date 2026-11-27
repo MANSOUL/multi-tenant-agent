@@ -28,15 +28,20 @@ cd ~/workspace/multi-tenant-agent
   `TENANT_ID=demo`、测试密钥、假 `LLM_API_KEY`、`DATA_DIR` 强制指向
   临时目录。
 
-## 覆盖（共 110 项，全过）
+## 覆盖（共 115 项，全过）
 
 | 文件 | 项数 | 覆盖 |
 |---|---|---|
 | `unit/test_reminder_parsing.py` | 33 | 新解析 11 + 新抽取 6 + 旧解析 10 + 旧抽取 6 |
 | `unit/test_reminder_rules.py` | 10 | 顺延/核对 6 + 例子/记忆 3 + TOOLS_DOC 含 update_reminder 1 |
+| `unit/test_event_log.py` | 5 | P0 事件日志：截断归档不删行、二次加载不重复归档、摘要路径、返回结构、归档行可查 |
 | `integration/test_reminder_tools.py` | 33 | 工具 8 + 附加 3 + Bug 4 8 + 旧工具 7 + 旧调度 6 + 调度器线程 1 |
 | `integration/test_files.py` | 29 | agent /files/ 19 + 网关 10 |
 | `e2e/test_reminder_dialogue.py` | 5 | 原对话 5 步（假模型走 `chat()` 整条图） |
+
+P0（2026-11-27）新增 `unit/test_event_log.py` 5 项，总数 110 → 115。
+另注意：P0 后 e2e 的假模型贴在 `model.client.ChatOpenAI` 上
+（原来贴在 `agent.graph.ChatOpenAI`，模型创建已收进 model 层）。
 
 ## 对账：总数怎么对上 VERIFY.md
 
