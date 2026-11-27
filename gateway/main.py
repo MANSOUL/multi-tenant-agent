@@ -140,7 +140,7 @@ class Handler(BaseHTTPRequestHandler):
                  "container": container_name(name)},
                 ensure_ascii=False),
                 "application/json",
-                {"Set-Cookie": f"mt_token={token}; Path=/; HttpOnly; SameSite=Lax"})
+                {"Set-Cookie": f"mt_token={token}; Path=/; Max-Age=43200; HttpOnly; SameSite=Lax"})
         if self.path.startswith("/api/"):
             return self._proxy()
         return self._send_error(not_found())

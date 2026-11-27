@@ -125,6 +125,16 @@ def get_tenant(handler) -> str | None:
         tenant = verify_token(auth[7:].strip())
         if tenant:
             return tenant
+    # 浏览器直接打开租户容器页面（agent/web/chat.html）时没有
+    # Authorization 头，靠网关登录时种的 mt_token cookie（HttpOnly，
+    # JS 读不到，但浏览器每次请求都会自动带上）认身份；和网关
+    # token_from 的 cookie 分支同口径。
+    for part in handler.headers.get("Cookie", "").split(";"):
+        part = part.strip()
+        if part.startswith("mt_token="):
+            tenant = verify_token(part[len("mt_token="):].strip())
+            if tenant and is_own_tenant(tenant):
+                return tenant
     # gateway 在容器内网转发时会带这个头；agent-api 端口不对外发布，
     # 所以只有可信的网关能走到这里。本地调试时用 TRUST_TENANT_HEADER=1 开启。
     forwarded = handler.headers.get("X-Tenant-Id", "")
