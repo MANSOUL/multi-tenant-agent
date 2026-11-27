@@ -319,13 +319,26 @@ class TestStoreBackendSwitch(unittest.TestCase):
                 create_store(_FakeConn())
 
     def test_connect_without_psycopg2_raises_clear_error(self):
-        # 本地 mtvenv 没装 psycopg2：connect() 必须报清楚的错，不报
-        # ImportError 原样，更不该静默返回一个假连接。
+        # psycopg2 不可用时 connect() 必须报清楚的错，不报 ImportError
+        # 原样，更不该静默返回一个假连接。2026-11-27 之前 mtvenv 里
+        # 没装 psycopg2，靠环境自然触发；装了之后改用 sys.modules
+        # 挡掉 import 来模拟（None 表示“ import 失败”）。
+        import sys
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("POSTGRES_DSN", None)
+            with mock.patch.dict(sys.modules, {"psycopg2": None}):
+                with self.assertRaises(RuntimeError) as cm:
+                    connect()
+            self.assertIn("psycopg2", str(cm.exception))
+
+    def test_connect_without_dsn_raises_clear_error(self):
+        # psycopg2 在，但没配 POSTGRES_DSN：同样报清楚的错。
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("POSTGRES_DSN", None)
             with self.assertRaises(RuntimeError) as cm:
                 connect()
-            self.assertIn("psycopg2", str(cm.exception))
+            self.assertIn("POSTGRES_DSN", str(cm.exception))
 
 
 class TestNoQuestionMarkSweep(unittest.TestCase):
