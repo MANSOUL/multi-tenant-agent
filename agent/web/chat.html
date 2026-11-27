@@ -6,6 +6,12 @@ body{font-family:system-ui;max-width:640px;margin:40px auto;padding:0 16px}
 .me{color:#2563eb}.pi{color:#16a34a}
 form{display:flex;gap:8px;margin-top:12px}
 input{flex:1;padding:8px;font-size:16px}button{padding:8px 16px}
+.think{font-size:12px;color:#888;white-space:pre-wrap}
+.think summary{cursor:pointer;color:#888}
+.think .tlog{margin:4px 0 0 0;padding-left:12px;border-left:2px solid #ddd}
+.dots::after{content:'…';animation:dots 1.2s steps(4) infinite}
+@keyframes dots{0%{content:''}25%{content:'…'}50%{content:'……'}75%{content:'………'}100%{content:''}}
+.err{color:#dc2626}
 </style></head><body><h1>多租户 Agent</h1>
 <p>请通过网关登录（http://宿主机:8080），登录后你的租户 id 会显示在这里。</p>
 <div id="log"></div>
@@ -13,11 +19,57 @@ input{flex:1;padding:8px;font-size:16px}button{padding:8px 16px}
 <script>
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function linkify(s){return esc(s).replace(/(https?:[/][/][^\s<>"'，。；：、）】]+|[/]files[/][^\s<>"'，。；：、）】]+)/g,'<a href="$1" target="_blank" rel="noopener">$1</a>');}
+function thinkLine(tlog, text){ const d=document.createElement('div'); d.textContent=text; tlog.appendChild(d); }
 async function send(e){e.preventDefault();
  const q=document.getElementById('q'); const t=q.value.trim(); if(!t) return; q.value='';
  const log=document.getElementById('log');
  log.innerHTML+=`<div class="me">你：${esc(t)}</div>`; log.scrollTop=log.scrollHeight;
- const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:t})});
- const d=await r.json();
- log.innerHTML+=`<div class="ai">助手：${linkify(d.reply||(d.error&&d.error.message)||d.error||'出错了')}</div>`; log.scrollTop=log.scrollHeight;}
+ // 先把助手气泡占出来：思考过程折叠区 + 回答区 + 跳动的点，用户不用干等。
+ const wrap=document.createElement('div'); wrap.className='ai';
+ wrap.innerHTML=`<div class="pi">助手：</div><details class="think" open><summary>思考过程</summary><div class="tlog"></div></details><div class="answer"><span class="dots">思考中</span></div>`;
+ log.appendChild(wrap); log.scrollTop=log.scrollHeight;
+ const tlog=wrap.querySelector('.tlog'), ans=wrap.querySelector('.answer');
+ const thinking=wrap.querySelector('.think');
+ let buf='', answer='', gotEvent=false, settled=false;
+ function finish(){ if(settled) return; settled=true;
+   ans.innerHTML=linkify(answer)||'<span class="err">出错了</span>';
+   thinking.open=false; log.scrollTop=log.scrollHeight; }
+ try{
+  const r=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:t})});
+  if(!r.ok || !r.body){ // 流开不起来就回退到老接口（一次返回整段）
+   const d=await r.json().catch(()=>({}));
+   answer=d.reply||(d.error&&d.error.message)||'出错了';
+   thinkLine(tlog,'（流式不可用，已回退到整段返回）'); finish(); return;
+  }
+  const reader=r.body.getReader(), dec=new TextDecoder();
+  while(true){ const {done,value}=await reader.read(); if(done) break;
+   buf+=dec.decode(value,{stream:true});
+   let idx; while((idx=buf.indexOf('\n\n'))>=0){ const raw=buf.slice(0,idx); buf=buf.slice(idx+2);
+    for(const line of raw.split('\n')){ if(!line.startsWith('data:')) continue;
+     let ev; try{ ev=JSON.parse(line.slice(5).trim()); }catch(_){ continue; }
+     gotEvent=true;
+     if(ev.type==='status'){ thinkLine(tlog, ev.text||ev.stage); }
+     else if(ev.type==='reasoning'){ thinkLine(tlog, '💭 '+ev.text); }
+     else if(ev.type==='token'){ if(!answer) ans.textContent=''; answer+=ev.text; ans.textContent=answer; }
+     else if(ev.type==='tool_call'){ thinkLine(tlog, '🔧 调用工具 '+ev.name+'('+JSON.stringify(ev.args||{})+')'); }
+     else if(ev.type==='tool_result'){ thinkLine(tlog, '✓ '+(ev.name||'工具')+' 返回：'+(ev.result||'')); }
+     else if(ev.type==='reminder_delivered'){ thinkLine(tlog, '⏰ 到点提醒：'+ev.text); }
+     else if(ev.type==='done'){ answer=ev.reply||answer; finish(); }
+     else if(ev.type==='error'){ answer=ev.message||'出错了'; ans.innerHTML='<span class="err">'+esc(answer)+'</span>'; thinking.open=false; settled=true; }
+    }
+    log.scrollTop=log.scrollHeight;
+   }
+  }
+  if(!gotEvent){ // 流开了但一个事件都没来，回退老接口
+   const d=await (await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:t})})).json();
+   answer=d.reply||(d.error&&d.error.message)||'出错了'; thinkLine(tlog,'（流式无事件，已回退到整段返回）');
+  }
+  finish();
+ }catch(err){ // 网络异常：回退老接口
+  try{ const d=await (await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:t})})).json();
+   answer=d.reply||(d.error&&d.error.message)||'出错了'; thinkLine(tlog,'（流式失败，已回退到整段返回）');
+  }catch(_){ answer='网络出错了，请再试一次'; }
+  finish();
+ }
+}
 </script></body></html>

@@ -58,12 +58,31 @@ def proxy_request(handler, tenant: str, ensure_fn=None) -> None:
     req = urllib.request.Request(
         agent_url(tenant) + handler.path, data=body, headers=headers,
         method=handler.command)
+    # 流式聊天（/api/chat/stream）的上游响应是 SSE：整轮模型调用
+    # 可能要几十秒，读完再发等于没流式——必须逐块透传。其它响应
+    # 还是老路子（一次读完再发）。流式超时放宽到 180 秒（模型整轮
+    # 超时默认 120 秒，网关要比它宽，不然先断的是网关）。
+    is_stream = handler.path == "/api/chat/stream"
+    timeout = 180 if is_stream else 90
     try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            data = resp.read()
-            touch(tenant)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             ctype = resp.headers.get("Content-Type") or \
                 "application/octet-stream"
+            if ctype.startswith("text/event-stream") and hasattr(
+                    handler, "_send_stream_start"):
+                handler._send_stream_start(resp.status, ctype)
+                try:
+                    while True:
+                        chunk = resp.read(4096)
+                        if not chunk:
+                            break
+                        handler._send_stream_chunk(chunk)
+                finally:
+                    handler._send_stream_end()
+                touch(tenant)
+                return None
+            data = resp.read()
+            touch(tenant)
             return handler._send(resp.status, data, ctype)
     except HTTPError as e:
         touch(tenant)

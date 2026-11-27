@@ -85,6 +85,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_stream_start(self, code, ctype):
+        """SSE 透传：发响应头（不带 Content-Length，靠关连接收尾），
+        立刻 flush——第一个事件到上游时就要能出去。"""
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self.wfile.flush()
+
+    def _send_stream_chunk(self, data: bytes):
+        """SSE 透传：写一块上游来的字节并立刻 flush。"""
+        self.wfile.write(data)
+        self.wfile.flush()
+
+    def _send_stream_end(self):
+        """SSE 透传收尾：再 flush 一次，保证尾巴不留在缓冲里。"""
+        self.wfile.flush()
+
     def _send_error(self, err: ApiError):
         """按统一错误结构发 JSON 错误响应（状态码由 ApiError 自带）。"""
         self._send(err.status, json.dumps(err.body(), ensure_ascii=False),

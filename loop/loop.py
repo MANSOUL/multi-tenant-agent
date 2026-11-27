@@ -175,3 +175,87 @@ class AgentLoop:
         except TimeoutError:
             hooks.fire_on_stop("timeout", history)
             raise
+
+
+# -- 流式（P5，SSE 思考过程）：graph.stream + 队列泵 --------------------
+def _chunk_text(chunk) -> str:
+    """从一条 LangGraph messages 流增量里取文本。
+
+    chunk 是 AIMessageChunk：content 可能是 str，也可能是
+    [{"type": "text", "text": ...}, ...] 这样的 parts 列表。
+    """
+    content = getattr(chunk, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "") for part in content
+            if isinstance(part, dict) and part.get("type") == "text")
+    return ""
+
+
+def _chunk_reasoning(chunk) -> str:
+    """从一条消息增量里取模型的思考内容（推理模型才有）。
+
+    deepseek-reasoner 的思考存在 additional_kwargs["reasoning_content"]
+    里；deepseek-chat 没有，返回空串。流式端把 reasoning 单独发
+    成 reasoning 事件，不混进回答正文。
+    """
+    reasoning = getattr(chunk, "reasoning_content", None)
+    if isinstance(reasoning, str) and reasoning:
+        return reasoning
+    kwargs = getattr(chunk, "additional_kwargs", None) or {}
+    reasoning = kwargs.get("reasoning_content")
+    return reasoning if isinstance(reasoning, str) else ""
+
+
+def _pump_stream(graph, initial_state, stream_config, q: queue.Queue):
+    """把 graph.stream() 的每一项推进队列（daemon 线程里跑）。
+
+    graph.stream(stream_mode=["messages", "updates"]) 每次产出
+    (mode, payload)：messages 模式是 (chunk, metadata)，updates
+    模式是 {节点名: 节点输出}。跑完放 ("end", None)，异常放
+    ("error", 异常对象)。
+    """
+    try:
+        for item in graph.stream(
+                initial_state, config=stream_config,
+                stream_mode=["messages", "updates"]):
+            q.put(("item", item))
+        q.put(("end", None))
+    except Exception as e:  # noqa: BLE001 - 异常原样带回调用方
+        q.put(("error", e))
+
+
+def stream_graph(graph, initial_state: dict, config: AgentLoopConfig,
+                 thread_id: str | None = None):
+    """流式调一张编译好的 LangGraph 图：逐项 yield graph.stream 的产出。
+
+    每一项是 (mode, payload)：mode 是 "messages"（LLM 逐 token 增量，
+    payload 是 (chunk, metadata)，metadata 里有 langgraph_node）
+    或 "updates"（某个节点跑完，payload 是 {节点名: 输出}）。
+    整轮超时走 config.timeout_seconds：超时后不再等，直接报
+    TimeoutError（泵线程是 daemon 的，不会拖住进程退出）。
+    """
+    stream_config: dict = {"recursion_limit": config.recursion_limit}
+    if thread_id:
+        stream_config["configurable"] = {"thread_id": thread_id}
+    q: queue.Queue = queue.Queue()
+    t = threading.Thread(
+        target=_pump_stream,
+        args=(graph, initial_state, stream_config, q), daemon=True)
+    t.start()
+    deadline = time.monotonic() + config.timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"调用超时（{config.timeout_seconds} 秒）")
+        try:
+            kind, value = q.get(timeout=remaining)
+        except queue.Empty:
+            raise TimeoutError(f"调用超时（{config.timeout_seconds} 秒）")
+        if kind == "end":
+            return
+        if kind == "error":
+            raise value
+        yield value

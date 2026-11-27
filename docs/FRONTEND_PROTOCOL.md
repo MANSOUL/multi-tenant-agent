@@ -38,6 +38,32 @@
 前端收到事件后只做展示（比如在提醒旁打个“已送达”标记、把工具调用折叠显示），
 不要用事件内容反推业务状态——事实来源永远是 `reply` 文本和后端的库。
 
+## 2.5 流式聊天（v1.1，2026-11-27，P5）
+
+`POST /api/chat/stream`（需登录，和 /api/chat 同样的入参
+`{"message": ..., "session_id": ...}`）：响应是 `text/event-stream`，
+每行一个事件，格式 `data: {...}\\n\\n`。鉴权/入参校验失败时
+**不开流**，直接按第 3 节的 JSON 错误返回；校验通过后立刻发第
+一个事件，用户不用干等。
+
+| type | 什么时候出现 | 字段 |
+|---|---|---|
+| `status` | 阶段变化：刚收到、记忆读完、开始调工具、工具跑完、整理回答 | `stage`：`received` / `thinking` / `tools` / `final`；`text`：给人看的中文 |
+| `reasoning` | 模型在流式返回里带了思考内容时（推理模型才有；deepseek-chat 没有，不发） | `text`：思考片段 |
+| `token` | 回答正文逐 token 增量 | `text`：增量文本，拼起来就是 `done.reply` |
+| `tool_call` | 本轮模型调了一次工具（字段和 v1.0 的同名事件一致） | `name`；`args` |
+| `tool_result` | 工具跑完（结果截到 200 字，不把大输出塞进流里） | `name`；`result` |
+| `reminder_delivered` | 本轮把一条到点提醒当面告诉了用户（字段和 v1.0 一致） | `notification_id`；`text`；`due_at` |
+| `done` | 整轮结束，流的最后一个事件 | `reply`：完整回复文本；`events`：本轮的 `tool_call` / `tool_result` / `reminder_delivered` 汇总（`status` / `token` / `reasoning` 不进汇总）；`session_id` |
+| `error` | 出错，流的最后一个事件（再无 `done`） | `code`：第 3 节的错误码；`message`：中文说明 |
+
+注意：`token` 增量是模型原样吐出来的——工具轮的简短铺垫
+（比如“好的，我来记一下”）也会出现在 token 流里，`done.reply`
+就是全部 token 拼起来的样子；非流式的 `/api/chat` 仍按老规则
+只取最后一条有文字的 AI 回复，两者极少数情况下措辞会有出入。
+前端收到 `done` / `error` 就收尾；中途断连时按 `done` 没到
+处理（可提示用户重试，或回退调一次 `/api/chat`）。
+
 ## 3. 错误响应（和聊天响应同一套结构）
 
 所有 HTTP 错误响应统一是：
@@ -82,6 +108,11 @@
 - v1.0（2026-11-27，P1）：定下 `reply` / `tenant` / `events` 和两种事件
   （`tool_call`、`reminder_delivered`），`events` 始终出现、可为空数组；
   错误响应统一为 `{"error": {"code", "message"}}`。
+- v1.1（2026-11-27，P5）：加 `POST /api/chat/stream`（SSE）和第 2.5 节的
+  8 种流事件（`status` / `reasoning` / `token` / `tool_call` /
+  `tool_result` / `reminder_delivered` / `done` / `error`）；v1.0 的
+  `/api/chat` 和事件含义一字不改。`chat` 占位类型被 `token` 替代，
+  不再启用。
 - 演进规则（只加不改）：以后只加新字段、新事件类型，不改现有字段的含义、
   不删字段、不把可选字段改成必填。`chat` 事件类型已占位，流式回复时再启用。
   破坏性改动必须升大版本并先改本文档。

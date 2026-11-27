@@ -115,7 +115,10 @@ def build_graph(tenant: str, loop_config: AgentLoopConfig | None = None,
     hooks = hooks or LoopHooks()
     tools = make_tools(tenant)
     tools_by_name = {t.name: t for t in tools}
-    llm = create_client()
+    # streaming=True：invoke() 仍返回完整消息，同时 graph.stream
+    # (stream_mode="messages") 能拿到逐 token 增量；流式和非流式
+    # 两条路共用这张图（见 model/client.py 的说明）。
+    llm = create_client(streaming=True)
     llm_with_tools = llm.bind_tools(tools)
 
     def recall_memory(state: AgentState) -> dict:

@@ -1,6 +1,7 @@
 """HTTP 服务（传输层）：只剩路由分发 + 请求校验入口。
 
-路由：/（聊天页）、/api/health、/api/chat、/api/me、/api/metrics、
+路由：/（聊天页）、/api/health、/api/chat、/api/chat/stream（SSE，见
+_handle_chat_stream）、/api/me、/api/metrics、
 /files/<路径>。聊天页是 agent/web/chat.html 静态文件，后端只读文件
 返回，不再内嵌 HTML 字符串；/files/ 的实现在 agent/file_server.py；
 错误响应统一走 errors/（{"error": {"code": ..., "message": ...}}）；
@@ -33,7 +34,7 @@ try:
     from .file_server import serve_file
     from .memory import check_due_reminders
     from .tenant import get_tenant
-    from app.chat_service import chat_with_events
+    from app.chat_service import chat_stream_with_events, chat_with_events
     from errors.codes import (
         ApiError, bad_request, model_failure, not_found,
         tenant_isolation_violation, unauthenticated,
@@ -48,7 +49,7 @@ except ImportError:  # 以脚本方式运行 python3 agent/app.py 时
     from file_server import serve_file
     from memory import check_due_reminders
     from tenant import get_tenant
-    from app.chat_service import chat_with_events
+    from app.chat_service import chat_stream_with_events, chat_with_events
     from errors.codes import (
         ApiError, bad_request, model_failure, not_found,
         tenant_isolation_violation, unauthenticated,
@@ -56,6 +57,16 @@ except ImportError:  # 以脚本方式运行 python3 agent/app.py 时
     from observability import health as health_mod
     from observability import logging as obs_logging
     from observability import metrics as obs_metrics
+
+
+def format_sse_event(event: dict) -> bytes:
+    """一个 SSE 事件 dict → wire 格式（data: {...}\\n\\n）。
+
+    前端按空行切事件、按 "data: " 取 JSON；事件里不出现裸换行
+    （json.dumps 会转义），所以一行一个事件足够。
+    """
+    return ("data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+            ).encode("utf-8")
 
 
 def _load_chat_page() -> str:
@@ -128,6 +139,24 @@ class Handler(BaseHTTPRequestHandler):
                 (time.monotonic() - getattr(
                     self, "_request_started", time.monotonic())) * 1000, 1))
 
+    def _send_sse_start(self):
+        """发 SSE 响应头（不带 Content-Length，靠关连接收尾）。
+
+        头一发出去网关/浏览器就能读到第一个事件，所以这里立刻
+        flush；之后每个事件也都 flush（见 _send_sse_event）。
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self.wfile.flush()
+
+    def _send_sse_event(self, event: dict):
+        """写一个 SSE 事件并立刻 flush（不等攒满缓冲）。"""
+        self.wfile.write(format_sse_event(event))
+        self.wfile.flush()
+
     def _send_error(self, err: ApiError):
         """按统一错误结构发 JSON 错误响应（状态码由 ApiError 自带）。"""
         self._send(err.status, json.dumps(err.body(), ensure_ascii=False),
@@ -172,7 +201,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._begin_request()
-        if self.path != "/api/chat":
+        if self.path not in ("/api/chat", "/api/chat/stream"):
             return self._send_error(not_found())
         tenant = self._need_tenant()
         if not tenant:
@@ -184,11 +213,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_error(bad_request("消息不是合法的 JSON"))
         if not isinstance(payload, dict):
             return self._send_error(bad_request("消息不是合法的 JSON"))
+        text = (payload.get("message") or "").strip()
+        if not text:
+            return self._send_error(bad_request("消息是空的"))
+        session_id = payload.get("session_id") or None
+        if self.path == "/api/chat/stream":
+            return self._handle_chat_stream(tenant, text, session_id)
         try:
-            text = (payload.get("message") or "").strip()
-            if not text:
-                return self._send_error(bad_request("消息是空的"))
-            session_id = payload.get("session_id") or None
             result = chat_with_events(tenant, text, session_id)
             self._send(200, json.dumps(
                 {"reply": result["reply"], "tenant": tenant,
@@ -200,6 +231,34 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_error(
                     tenant_isolation_violation(str(e)))
             return self._send_error(model_failure(f"模型调用失败：{e}"))
+
+    def _handle_chat_stream(self, tenant, text, session_id):
+        """POST /api/chat/stream：SSE 流式聊天（协议 v1.1）。
+
+        鉴权和入参校验和 /api/chat 一模一样（失败时先按普通 JSON
+        错误返回，不开流）；校验通过后立刻发 SSE 头，之后每个事件
+        现产现发。生成器本身不抛异常，但迭代时万一冒出异常也补一个
+        error 事件再收尾，不让连接半路断在没交代的状态。
+        """
+        self._send_sse_start()
+        try:
+            for event in chat_stream_with_events(tenant, text, session_id):
+                self._send_sse_event(event)
+        except Exception as e:  # noqa: BLE001 - 流中断也要给前端一个交代
+            self._send_sse_event({
+                "type": "error", "code": "model_error",
+                "message": f"模型调用失败：{e}"})
+        # 请求计数在 _begin_request 里已经记过一次，这里只补一条
+        # 完成日志（_send() 的日志在流式路径里不会走）。
+        obs_logging.emit(
+            "http_response", level="info",
+            request_id=getattr(self, "_request_id", ""),
+            tenant=getattr(self, "_tenant", ""),
+            method=self.command, path="/api/chat/stream",
+            status=200,
+            duration_ms=round(
+                (time.monotonic() - getattr(
+                    self, "_request_started", time.monotonic())) * 1000, 1))
 
 
 def main():

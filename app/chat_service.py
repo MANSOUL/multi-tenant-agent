@@ -143,6 +143,142 @@ class ChatService:
                                          since_index=prior_messages),
                 "session_id": sid}
 
+    # -- 流式入口（P5，SSE 思考过程）--------------------------------------
+    def chat_stream(self, tenant: str, user_text: str,
+                    session_id: str | None = None):
+        """流式聊一句，逐个 yield SSE 事件 dict（协议 v1.1，见
+        docs/FRONTEND_PROTOCOL.md）。
+
+        事件顺序：status（已收到，立刻发——用户不用干等）→ token /
+        reasoning / tool_call / tool_result / reminder_delivered →
+        done（带完整 reply 和本轮 events）或 error。生成器本身不抛
+        异常：租户不对、没 key、超时、模型失败都变成 error 事件，
+        前端收到就收尾。
+        """
+        from loop.loop import _chunk_reasoning, _chunk_text, stream_graph
+
+        # 第一字节要快：先告诉用户“收到了”，再做会话/检查这些慢活。
+        yield {"type": "status", "stage": "received",
+               "text": "已收到，正在思考…"}
+        if TENANT_ID and not is_own_tenant(tenant):
+            yield {"type": "error", "code": "tenant_isolation",
+                   "message": f"这个容器只服务租户 {TENANT_ID}，"
+                              f"不处理租户 {tenant} 的请求"}
+            return
+        if not has_api_key():
+            yield {"type": "error", "code": "model_error",
+                   "message": "还没填模型密钥：复制 .env.example 成 .env 再填"}
+            return
+        started_at = datetime.now(timezone.utc).isoformat()
+        try:
+            session = self.sessions.ensure_session(tenant, session_id)
+        except Exception as e:  # noqa: BLE001 - 会话建不出来也走 error 事件
+            yield {"type": "error", "code": "internal_error",
+                   "message": f"会话打不开：{e}"}
+            return
+        sid = session["id"]
+        if session["status"] == "archived":
+            yield {"type": "error", "code": "model_error",
+                   "message": f"会话 {sid} 已归档，只读，不能再发消息"}
+            return
+
+        hits = check_injection(user_text)
+        if hits:
+            log_injection(tenant, user_text, hits)
+        note = guardrail_note(hits)
+
+        stripped = (user_text or "").strip()
+        if stripped in PERIOD_WORDS:
+            reply_text = self.reminders.resolve_clarification(
+                tenant, stripped)
+            if reply_text is not None:
+                self._append_turn_text(tenant, user_text, reply_text)
+                self._record_turn(tenant, sid, user_text, reply_text,
+                                  started_at)
+                yield {"type": "done", "reply": reply_text, "events": [],
+                       "session_id": sid}
+                return
+
+        graph = self.sessions.get_graph(
+            tenant, sid, self._graph_builder,
+            salt=id(client_mod.ChatOpenAI))
+        events: list = []
+        reply_parts: list = []
+        tool_names_by_id: dict = {}
+        try:
+            for mode, payload in stream_graph(
+                    graph,
+                    {"messages": [HumanMessage(content=user_text)],
+                     "tenant_id": tenant, "steps": 0, "facts": "",
+                     "summary": "", "history_text": "", "todos": "",
+                     "reminders": "", "due_notifications": [],
+                     "guardrail_note": note},
+                    self.loop_config, thread_id=sid):
+                if mode == "messages":
+                    chunk, _meta = payload
+                    reasoning = _chunk_reasoning(chunk)
+                    if reasoning:
+                        yield {"type": "reasoning", "text": reasoning}
+                    text = _chunk_text(chunk)
+                    if text:
+                        reply_parts.append(text)
+                        yield {"type": "token", "text": text}
+                    continue
+                if mode != "updates":
+                    continue
+                for node, output in (payload or {}).items():
+                    if node == "recall_memory":
+                        for n in (output or {}).get("due_notifications") or []:
+                            events.append({
+                                "type": "reminder_delivered",
+                                "notification_id": n.get("id"),
+                                "text": n.get("text"),
+                                "due_at": n.get("due_at")})
+                            yield events[-1]
+                        yield {"type": "status", "stage": "thinking",
+                               "text": "记忆读完了，正在思考…"}
+                    elif node == "llm":
+                        for msg in (output or {}).get("messages") or []:
+                            for tc in getattr(msg, "tool_calls", None) or []:
+                                tool_names_by_id[tc.get("id", "")] = \
+                                    tc.get("name", "")
+                                events.append({
+                                    "type": "tool_call",
+                                    "name": tc.get("name"),
+                                    "args": tc.get("args", {})})
+                                yield events[-1]
+                        if tool_names_by_id:
+                            yield {"type": "status", "stage": "tools",
+                                   "text": "正在调工具…"}
+                    elif node == "tools":
+                        for msg in (output or {}).get("messages") or []:
+                            result = getattr(msg, "content", "") or ""
+                            if len(result) > 200:
+                                result = result[:200] + "…"
+                            events.append({
+                                "type": "tool_result",
+                                "name": tool_names_by_id.get(
+                                    getattr(msg, "tool_call_id", ""), ""),
+                                "result": result})
+                            yield events[-1]
+                        yield {"type": "status", "stage": "thinking",
+                               "text": "工具跑完了，继续思考…"}
+                    elif node == "final_llm":
+                        yield {"type": "status", "stage": "final",
+                               "text": "正在整理回答…"}
+        except TimeoutError as e:
+            yield {"type": "error", "code": "model_error",
+                   "message": f"模型调用超时：{e}"}
+            return
+        except Exception as e:  # noqa: BLE001 - 模型失败变 error 事件
+            yield {"type": "error", "code": "model_error",
+                   "message": f"模型调用失败：{e}"}
+            return
+        reply = "".join(reply_parts)
+        self._record_turn(tenant, sid, user_text, reply, started_at)
+        yield {"type": "done", "reply": reply, "events": events,
+               "session_id": sid}
+
     def chat_text(self, tenant: str, user_text: str,
                   session_id: str | None = None) -> str:
         """聊一句，只返回回复文本（兼容旧 chat() 签名）。"""
@@ -217,3 +353,13 @@ def chat_with_events(tenant: str, user_text: str,
     """聊一句，返回 {"reply": 回复文本, "events": [...],
     "session_id": 会话 id}（前端协议 v1.0，events 始终出现）。"""
     return _default_service().chat(tenant, user_text, session_id)
+
+
+def chat_stream_with_events(tenant: str, user_text: str,
+                            session_id: str | None = None):
+    """流式聊一句，返回 SSE 事件的生成器（前端协议 v1.1）。
+
+    事件逐个 yield：status → token / reasoning / tool_call /
+    tool_result / reminder_delivered → done 或 error。
+    """
+    return _default_service().chat_stream(tenant, user_text, session_id)
