@@ -31,6 +31,11 @@
 没有改密码、没有多因素。生产请换成 Keycloak / Authentik（OIDC），
 把 GATEWAY_USERS 和这套 token 逻辑整个替换掉，agent 容器不用改——
 它只认 X-Tenant-Token / X-Tenant-Id，见 agent/tenant.py 的 get_tenant。
+
+P1（2026-11-27）：登录页已从内嵌字符串拆成 gateway/web/login.html
+（后端只读文件返回）；错误响应统一走 errors/（{"error": {"code": ...,
+"message": ...}}），状态码不变。构建时注意：gateway/Dockerfile 要把
+gateway/web/ 和顶层 errors/ 一起拷进镜像（见 Dockerfile 注释）。
 """
 import hashlib
 import hmac
@@ -43,7 +48,21 @@ import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.error import HTTPError
+
+try:
+    from errors.codes import (
+        ApiError, bad_request, not_found, unauthenticated,
+        upstream_unavailable,
+    )
+except ImportError:  # 以脚本方式运行 python3 gateway/gateway.py 时
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from errors.codes import (
+        ApiError, bad_request, not_found, unauthenticated,
+        upstream_unavailable,
+    )
 
 PORT = int(os.environ.get("PORT", "8080"))
 SECRET = os.environ.get("GATEWAY_SECRET", "change-me-to-a-long-random-string")
@@ -273,51 +292,13 @@ def _reaper_loop() -> None:
             pass
 
 
-LOGIN_PAGE = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>登录 · 多租户 Agent</title><style>
-body{font-family:system-ui;max-width:420px;margin:80px auto;padding:0 16px}
-input{display:block;width:100%;padding:10px;margin:8px 0;font-size:16px;box-sizing:border-box}
-button{padding:10px 20px;font-size:16px}
-#msg{color:#dc2626;white-space:pre-wrap}
-#chat{display:none}
-#log{border:1px solid #ccc;border-radius:8px;padding:12px;height:40vh;overflow:auto;white-space:pre-wrap}
-.me{color:#2563eb}.ai{color:#16a34a}
-form{display:flex;gap:8px;margin-top:12px}
-</style></head><body>
-<div id="login"><h1>登录</h1>
-<p>演示账号见 .env 的 GATEWAY_USERS（生产请换 Keycloak / Authentik）。</p>
-<p>每个租户有自己独立的 agent 容器，首次登录会稍等几秒等容器启动。</p>
-<input id="u" placeholder="用户名（即租户 id）" autocomplete="username">
-<input id="p" type="password" placeholder="密码" autocomplete="current-password">
-<button onclick="login()">登录</button><p id="msg"></p></div>
-<div id="chat"><h1>多租户 Agent</h1><p id="who"></p>
-<div id="log"></div>
-<form onsubmit="send(event)"><input id="q" autocomplete="off" placeholder="跟助手说点什么…"><button>发送</button></form>
-<p><button onclick="logout()">退出登录</button></p></div>
-<script>
-let token='';
-function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-function linkify(s){return esc(s).replace(/(https?:[/][/][^\s<>"'，。；：、）】]+|[/]files[/][^\s<>"'，。；：、）】]+)/g,'<a href="$1" target="_blank" rel="noopener">$1</a>');}
-async function login(){
- const u=document.getElementById('u').value.trim();
- const p=document.getElementById('p').value;
- const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
- const d=await r.json();
- if(!r.ok){document.getElementById('msg').textContent=d.error||'登录失败';return;}
- token=d.token; document.cookie='mt_token='+token+'; path=/';
- document.getElementById('login').style.display='none';
- document.getElementById('chat').style.display='block';
- document.getElementById('who').textContent='已登录，租户：'+d.tenant;}
-async function send(e){e.preventDefault();
- const q=document.getElementById('q'); const t=q.value.trim(); if(!t) return; q.value='';
- const log=document.getElementById('log');
- log.innerHTML+=`<div class="me">你：${esc(t)}</div>`; log.scrollTop=log.scrollHeight;
- const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({message:t})});
- const d=await r.json();
- log.innerHTML+=`<div class="ai">助手：${linkify(d.reply||d.error||'出错了')}</div>`; log.scrollTop=log.scrollHeight;}
-function logout(){document.cookie='mt_token=; path=/; max-age=0';location.reload();}
-</script></body></html>"""
+def _load_login_page() -> str:
+    """读登录页静态文件（gateway/web/login.html）；后端只读文件返回。"""
+    return (Path(__file__).resolve().parent / "web" / "login.html").read_text(
+        encoding="utf-8")
+
+
+LOGIN_HTML = _load_login_page()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -334,6 +315,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_error(self, err: ApiError):
+        """按统一错误结构发 JSON 错误响应（状态码由 ApiError 自带）。"""
+        self._send(err.status, json.dumps(err.body(), ensure_ascii=False),
+                   "application/json")
+
     def _read_json(self) -> dict:
         try:
             return json.loads(self.rfile.read(
@@ -343,10 +329,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
-            return self._send(200, LOGIN_PAGE)
+            return self._send(200, LOGIN_HTML)
         if self.path.startswith("/api/") or self.path.startswith("/files/"):
             return self._proxy()
-        return self._send(404, "not found", "text/plain")
+        return self._send_error(not_found())
 
     def do_POST(self):
         if self.path == "/api/login":
@@ -355,15 +341,13 @@ class Handler(BaseHTTPRequestHandler):
             name = (payload.get("username") or "").strip()
             if name in users and users[name] == (payload.get("password") or ""):
                 if not is_valid_tenant(name):
-                    return self._send(400, json.dumps(
-                        {"error": f"租户 id 不合法：{name!r}，只允许字母数字 _ -"},
-                        ensure_ascii=False), "application/json")
+                    return self._send_error(bad_request(
+                        f"租户 id 不合法：{name!r}，只允许字母数字 _ -"))
                 try:
                     ensure_tenant_container(name)
                 except RuntimeError as e:
-                    return self._send(502, json.dumps(
-                        {"error": f"租户容器启动失败：{e}"},
-                        ensure_ascii=False), "application/json")
+                    return self._send_error(upstream_unavailable(
+                        f"租户容器启动失败：{e}"))
                 token = make_token(name)
                 return self._send(200, json.dumps(
                     {"token": token, "tenant": name,
@@ -371,26 +355,21 @@ class Handler(BaseHTTPRequestHandler):
                     ensure_ascii=False),
                     "application/json",
                     {"Set-Cookie": f"mt_token={token}; Path=/; HttpOnly; SameSite=Lax"})
-            return self._send(401, json.dumps(
-                {"error": "用户名或密码不对"}, ensure_ascii=False),
-                "application/json")
+            return self._send_error(unauthenticated("用户名或密码不对"))
         if self.path.startswith("/api/"):
             return self._proxy()
-        return self._send(404, "not found", "text/plain")
+        return self._send_error(not_found())
 
     def _proxy(self):
         """校验 token → ensure 租户容器 → 透传到该租户的容器，带上租户身份。"""
         tenant = verify_token(token_from(self))
         if not tenant:
-            return self._send(401, json.dumps(
-                {"error": "未登录：请先登录"}, ensure_ascii=False),
-                "application/json")
+            return self._send_error(unauthenticated("未登录：请先登录"))
         try:
             ensure_tenant_container(tenant)
         except RuntimeError as e:
-            return self._send(502, json.dumps(
-                {"error": f"租户容器不可用：{e}"}, ensure_ascii=False),
-                "application/json")
+            return self._send_error(upstream_unavailable(
+                f"租户容器不可用：{e}"))
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else None
         headers = {
@@ -418,9 +397,8 @@ class Handler(BaseHTTPRequestHandler):
                 "application/octet-stream"
             return self._send(e.code, e.read(), ctype)
         except Exception as e:  # noqa: BLE001 - 代理失败时把原因告诉前端
-            return self._send(502, json.dumps(
-                {"error": f"连不上租户容器 {container_name(tenant)}：{e}"},
-                ensure_ascii=False), "application/json")
+            return self._send_error(upstream_unavailable(
+                f"连不上租户容器 {container_name(tenant)}：{e}"))
 
 
 if __name__ == "__main__":

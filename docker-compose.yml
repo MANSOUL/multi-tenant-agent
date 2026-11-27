@@ -10,7 +10,11 @@
 # 租户镜像不在这里起：先 build（见 README 快速开始），网关再用它起容器。
 services:
   gateway:
-    build: ./gateway
+    # P1：构建上下文是仓库根目录（不是 ./gateway），因为网关要拷顶层
+    # errors/（统一错误码）和 gateway/web/login.html，见 gateway/Dockerfile。
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
     container_name: mt-gateway
     restart: unless-stopped
     env_file:

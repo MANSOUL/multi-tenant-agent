@@ -21,6 +21,7 @@ try:
     from .tools import make_tools
     from context.assembler import assemble_context, build_system_prompt
     from model.client import create_client, invoke
+    from observability import metrics as obs_metrics
     from store.sqlite_store import SQLiteStore
 except ImportError:  # 以脚本方式运行 python3 agent/app.py 时，项目根目录不在 path 上
     import sys
@@ -32,6 +33,7 @@ except ImportError:  # 以脚本方式运行 python3 agent/app.py 时，项目�
     from tools import make_tools
     from context.assembler import assemble_context, build_system_prompt
     from model.client import create_client, invoke
+    from observability import metrics as obs_metrics
     from store.sqlite_store import SQLiteStore
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -85,6 +87,7 @@ def build_graph(tenant: str):
 
     def call_llm(state: AgentState) -> dict:
         """调模型节点：带上系统提示（含摘要/记忆/最近对话）+ 对话，返回一条 AIMessage。"""
+        obs_metrics.inc(obs_metrics.MODEL_CALLS)
         reply = invoke(
             llm_with_tools,
             [SystemMessage(content=_system_prompt(state))]
@@ -94,6 +97,7 @@ def build_graph(tenant: str):
 
     def final_llm(state: AgentState) -> dict:
         """最后一轮：工具轮数已到上限，这次不带工具，强制模型直接回答。"""
+        obs_metrics.inc(obs_metrics.MODEL_CALLS)
         reply = invoke(
             llm,
             [SystemMessage(content=_system_prompt(state))]
@@ -164,7 +168,63 @@ def build_graph(tenant: str):
     return graph.compile()
 
 
+def collect_events(result: dict) -> list:
+    """从一次图执行结果里收集前端事件（纯函数，见 docs/FRONTEND_PROTOCOL.md）。
+
+    顺序：先是本轮送达的提醒（recall_memory 时读到的待送达提醒，
+    save_memory 已把它们标为已送达），再是本轮的工具调用（按消息顺序）。
+    P1 只产这两种事件；"chat" 类型已在协议里占位，本阶段不发。
+    result 是 graph.invoke 的返回：messages 里带 tool_calls 的 AIMessage、
+    due_notifications 是 recall_memory 读到的待送达提醒列表。
+    """
+    events = []
+    for n in result.get("due_notifications") or []:
+        events.append({
+            "type": "reminder_delivered",
+            "notification_id": n.get("id"),
+            "text": n.get("text"),
+            "due_at": n.get("due_at"),
+        })
+    for msg in result.get("messages") or []:
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            for tc in msg.tool_calls:
+                events.append({
+                    "type": "tool_call",
+                    "name": tc.get("name"),
+                    "args": tc.get("args", {}),
+                })
+    return events
+
+
+def _extract_reply(result: dict) -> str:
+    """从图执行结果里取最后一条有文字的 AI 回复（原来 chat() 里的逻辑）。"""
+    for msg in reversed(result["messages"]):
+        if isinstance(msg, AIMessage) and isinstance(msg.content, str) \
+                and msg.content.strip():
+            return msg.content
+        if isinstance(msg, AIMessage) and isinstance(msg.content, list):
+            text = "".join(
+                part.get("text", "") for part in msg.content
+                if isinstance(part, dict) and part.get("type") == "text"
+            ).strip()
+            if text:
+                return text
+    return "（模型没有返回文字回答）"
+
+
 def chat(tenant: str, user_text: str) -> str:
+    """聊一句，返回回复文本（兼容旧签名；要事件时调 chat_with_events）。"""
+    return chat_with_events(tenant, user_text)["reply"]
+
+
+def chat_with_events(tenant: str, user_text: str) -> dict:
+    """聊一句，返回 {"reply": 回复文本, "events": [...]}（前端协议 v1.0）。
+
+    events 始终出现，没有事件时是空数组。事件由 collect_events() 从
+    图执行结果里收集：本轮的工具调用（tool_call）+ 本轮送达的提醒
+    （reminder_delivered）。异常行为和 chat() 原来一样：租户不对、
+    没 key、模型失败都抛 RuntimeError。
+    """
     # 单租户容器只服务自己的租户：网关路由错了也在这里挡掉，不读别人的库。
     if TENANT_ID and not is_own_tenant(tenant):
         raise RuntimeError(
@@ -182,15 +242,5 @@ def chat(tenant: str, user_text: str) -> str:
         )
     except Exception as e:  # noqa: BLE001 - 模型接口报错时原样告诉用户
         raise RuntimeError(f"模型调用失败：{e}")
-    for msg in reversed(result["messages"]):
-        if isinstance(msg, AIMessage) and isinstance(msg.content, str) \
-                and msg.content.strip():
-            return msg.content
-        if isinstance(msg, AIMessage) and isinstance(msg.content, list):
-            text = "".join(
-                part.get("text", "") for part in msg.content
-                if isinstance(part, dict) and part.get("type") == "text"
-            ).strip()
-            if text:
-                return text
-    return "（模型没有返回文字回答）"
+    return {"reply": _extract_reply(result),
+            "events": collect_events(result)}

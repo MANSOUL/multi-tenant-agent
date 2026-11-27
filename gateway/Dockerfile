@@ -8,6 +8,14 @@ WORKDIR /app
 RUN apt-get update -qq \
     && apt-get install -y --no-install-recommends docker-cli \
     && rm -rf /var/lib/apt/lists/*
-COPY gateway.py ./gateway.py
+
+# P1：构建上下文是仓库根目录（见 docker-compose.yml gateway.build），
+# 因为网关除了自己的 gateway.py，还要顶层 errors/（统一错误码）和
+# gateway/web/login.html（登录页静态文件，后端只读文件返回）。
+# 只拷 gateway.py 的旧写法会让新版网关在容器里 import errors 失败、
+# 读不到登录页——不要改回单文件 COPY。
+COPY gateway/gateway.py ./gateway.py
+COPY gateway/web/ ./web/
+COPY errors/ ./errors/
 EXPOSE 8080
 CMD ["python3", "gateway.py"]

@@ -1,0 +1,45 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · 多租户 Agent</title><style>
+body{font-family:system-ui;max-width:420px;margin:80px auto;padding:0 16px}
+input{display:block;width:100%;padding:10px;margin:8px 0;font-size:16px;box-sizing:border-box}
+button{padding:10px 20px;font-size:16px}
+#msg{color:#dc2626;white-space:pre-wrap}
+#chat{display:none}
+#log{border:1px solid #ccc;border-radius:8px;padding:12px;height:40vh;overflow:auto;white-space:pre-wrap}
+.me{color:#2563eb}.ai{color:#16a34a}
+form{display:flex;gap:8px;margin-top:12px}
+</style></head><body>
+<div id="login"><h1>登录</h1>
+<p>演示账号见 .env 的 GATEWAY_USERS（生产请换 Keycloak / Authentik）。</p>
+<p>每个租户有自己独立的 agent 容器，首次登录会稍等几秒等容器启动。</p>
+<input id="u" placeholder="用户名（即租户 id）" autocomplete="username">
+<input id="p" type="password" placeholder="密码" autocomplete="current-password">
+<button onclick="login()">登录</button><p id="msg"></p></div>
+<div id="chat"><h1>多租户 Agent</h1><p id="who"></p>
+<div id="log"></div>
+<form onsubmit="send(event)"><input id="q" autocomplete="off" placeholder="跟助手说点什么…"><button>发送</button></form>
+<p><button onclick="logout()">退出登录</button></p></div>
+<script>
+let token='';
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function linkify(s){return esc(s).replace(/(https?:[/][/][^\s<>"'，。；：、）】]+|[/]files[/][^\s<>"'，。；：、）】]+)/g,'<a href="$1" target="_blank" rel="noopener">$1</a>');}
+async function login(){
+ const u=document.getElementById('u').value.trim();
+ const p=document.getElementById('p').value;
+ const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+ const d=await r.json();
+ if(!r.ok){document.getElementById('msg').textContent=(d.error&&d.error.message)||d.error||'登录失败';return;}
+ token=d.token; document.cookie='mt_token='+token+'; path=/';
+ document.getElementById('login').style.display='none';
+ document.getElementById('chat').style.display='block';
+ document.getElementById('who').textContent='已登录，租户：'+d.tenant;}
+async function send(e){e.preventDefault();
+ const q=document.getElementById('q'); const t=q.value.trim(); if(!t) return; q.value='';
+ const log=document.getElementById('log');
+ log.innerHTML+=`<div class="me">你：${esc(t)}</div>`; log.scrollTop=log.scrollHeight;
+ const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify({message:t})});
+ const d=await r.json();
+ log.innerHTML+=`<div class="ai">助手：${linkify(d.reply||(d.error&&d.error.message)||d.error||'出错了')}</div>`; log.scrollTop=log.scrollHeight;}
+function logout(){document.cookie='mt_token=; path=/; max-age=0';location.reload();}
+</script></body></html>

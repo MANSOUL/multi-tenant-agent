@@ -1,0 +1,23 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>多租户 Agent</title><style>
+body{font-family:system-ui;max-width:640px;margin:40px auto;padding:0 16px}
+#log{border:1px solid #ccc;border-radius:8px;padding:12px;height:50vh;overflow:auto;white-space:pre-wrap}
+.me{color:#2563eb}.pi{color:#16a34a}
+form{display:flex;gap:8px;margin-top:12px}
+input{flex:1;padding:8px;font-size:16px}button{padding:8px 16px}
+</style></head><body><h1>多租户 Agent</h1>
+<p>请通过网关登录（http://宿主机:8080），登录后你的租户 id 会显示在这里。</p>
+<div id="log"></div>
+<form onsubmit="send(event)"><input id="q" autocomplete="off" placeholder="跟助手说点什么…"><button>发送</button></form>
+<script>
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function linkify(s){return esc(s).replace(/(https?:[/][/][^\s<>"'，。；：、）】]+|[/]files[/][^\s<>"'，。；：、）】]+)/g,'<a href="$1" target="_blank" rel="noopener">$1</a>');}
+async function send(e){e.preventDefault();
+ const q=document.getElementById('q'); const t=q.value.trim(); if(!t) return; q.value='';
+ const log=document.getElementById('log');
+ log.innerHTML+=`<div class="me">你：${esc(t)}</div>`; log.scrollTop=log.scrollHeight;
+ const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:t})});
+ const d=await r.json();
+ log.innerHTML+=`<div class="ai">助手：${linkify(d.reply||(d.error&&d.error.message)||d.error||'出错了')}</div>`; log.scrollTop=log.scrollHeight;}
+</script></body></html>

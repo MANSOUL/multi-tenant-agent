@@ -13,6 +13,11 @@ COPY domain/ ./domain/
 COPY store/ ./store/
 COPY model/ ./model/
 COPY context/ ./context/
+# P1 新增的横切包：errors/（统一错误码）+ observability/（日志/健康/指标），
+# agent/server.py、agent/graph.py、agent/file_server.py 都 import 它们。
+# agent/web/chat.html 随 COPY agent/ 一起进镜像，不用单独拷。
+COPY errors/ ./errors/
+COPY observability/ ./observability/
 # 让 `python3 agent/app.py` 脚本模式也能 import 顶层包（否则 sys.path
 # 只有 agent/ 目录，`import domain` 会失败）。
 ENV PYTHONPATH=/app

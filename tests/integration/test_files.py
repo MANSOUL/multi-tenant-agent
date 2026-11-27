@@ -265,9 +265,19 @@ class TestGatewayFiles(unittest.TestCase):
         self.assertEqual(calls, ["proxy"])
 
     def test_agent_page_linkifies_files_links(self):
-        self.assertIn("linkify", server_mod.PAGE)
-        self.assertIn("[/]files[/]", server_mod.PAGE)
+        # P1：聊天页已从 server_mod.PAGE 字符串拆成 agent/web/chat.html，
+        # 断言改成读静态文件，意图不变（页面里有 linkify 且能链 /files/ 链接）。
+        from pathlib import Path
+        page = (Path(server_mod.__file__).parent / "web" / "chat.html"
+                ).read_text(encoding="utf-8")
+        self.assertIn("linkify", page)
+        self.assertIn("[/]files[/]", page)
 
     def test_gateway_page_linkifies_files_links(self):
-        self.assertIn("linkify", gateway_mod.LOGIN_PAGE)
-        self.assertIn("[/]files[/]", gateway_mod.LOGIN_PAGE)
+        # P1：登录页已从 gateway_mod.LOGIN_PAGE 字符串拆成
+        # gateway/web/login.html，断言改成读静态文件，意图不变。
+        from pathlib import Path
+        page = (Path(gateway_mod.__file__).parent / "web" / "login.html"
+                ).read_text(encoding="utf-8")
+        self.assertIn("linkify", page)
+        self.assertIn("[/]files[/]", page)

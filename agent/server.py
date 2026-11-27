@@ -1,10 +1,15 @@
-"""HTTP 服务：聊天页面 + /api/health、/api/chat、/api/me + /files/<路径>。
+"""HTTP 服务（传输层）：只剩路由分发 + 请求校验入口。
 
-/files/ 只发本租户 workspace 里的网页/静态文件（html/css/js/图片等），
-先过 _need_tenant() 鉴权，再用 safe_path 锁在 workspace 内，见 _serve_file。
+路由：/（聊天页）、/api/health、/api/chat、/api/me、/api/metrics、
+/files/<路径>。聊天页是 agent/web/chat.html 静态文件，后端只读文件
+返回，不再内嵌 HTML 字符串；/files/ 的实现在 agent/file_server.py；
+错误响应统一走 errors/（{"error": {"code": ..., "message": ...}}）；
+健康检查的实现在 observability/health.py，指标在
+observability/metrics.py（/api/metrics 只读 Prometheus 文本）。
 
-只负责 HTTP 层：鉴权（调 tenant.get_tenant）、把消息交给 graph.chat()、
-返回 JSON。业务逻辑（图、工具、记忆、沙箱）都在别的模块。
+只负责 HTTP 层：鉴权（调 tenant.get_tenant）、把消息交给
+graph.chat_with_events()、返回 JSON。业务逻辑（图、工具、记忆、沙箱）
+都在别的模块。
 提醒调度器（2026-11-26）：启动时起一个守护线程，每 30 秒扫一次本租户
 （单租户容器）或 DATA_DIR 下所有租户（老的多租户进程模式）的 reminders，
 到点的写进 pending_notifications 表；下次用户来聊天时，recall_memory
@@ -13,23 +18,50 @@
 聊天时提醒”，不要在任何地方假装能推送（见 README 能力边界）。
 """
 import json
-import mimetypes
 import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlparse
+from pathlib import Path
+from urllib.parse import urlparse
 
 try:
     from .config import DATA_DIR, MODEL, PORT, SINGLE_TENANT_MODE, TENANT_ID
-    from .graph import chat
+    from .file_server import serve_file
+    from .graph import chat_with_events
     from .memory import check_due_reminders
-    from .tenant import get_tenant, safe_path
+    from .tenant import get_tenant
+    from errors.codes import (
+        ApiError, bad_request, model_failure, not_found,
+        tenant_isolation_violation, unauthenticated,
+    )
+    from observability import health as health_mod
+    from observability import logging as obs_logging
+    from observability import metrics as obs_metrics
 except ImportError:  # 以脚本方式运行 python3 agent/app.py 时
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from config import DATA_DIR, MODEL, PORT, SINGLE_TENANT_MODE, TENANT_ID
-    from graph import chat
+    from file_server import serve_file
+    from graph import chat_with_events
     from memory import check_due_reminders
-    from tenant import get_tenant, safe_path
+    from tenant import get_tenant
+    from errors.codes import (
+        ApiError, bad_request, model_failure, not_found,
+        tenant_isolation_violation, unauthenticated,
+    )
+    from observability import health as health_mod
+    from observability import logging as obs_logging
+    from observability import metrics as obs_metrics
+
+
+def _load_chat_page() -> str:
+    """读聊天页静态文件（agent/web/chat.html）；后端只读文件返回。"""
+    return (Path(__file__).resolve().parent / "web" / "chat.html").read_text(
+        encoding="utf-8")
+
+
+CHAT_HTML = _load_chat_page()
 
 
 def _reminder_tenants():
@@ -61,34 +93,18 @@ def start_reminder_scheduler(interval_seconds: int = 30) -> threading.Thread:
     t.start()
     return t
 
-PAGE = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>多租户 Agent</title><style>
-body{font-family:system-ui;max-width:640px;margin:40px auto;padding:0 16px}
-#log{border:1px solid #ccc;border-radius:8px;padding:12px;height:50vh;overflow:auto;white-space:pre-wrap}
-.me{color:#2563eb}.pi{color:#16a34a}
-form{display:flex;gap:8px;margin-top:12px}
-input{flex:1;padding:8px;font-size:16px}button{padding:8px 16px}
-</style></head><body><h1>多租户 Agent</h1>
-<p>请通过网关登录（http://宿主机:8080），登录后你的租户 id 会显示在这里。</p>
-<div id="log"></div>
-<form onsubmit="send(event)"><input id="q" autocomplete="off" placeholder="跟助手说点什么…"><button>发送</button></form>
-<script>
-function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-function linkify(s){return esc(s).replace(/(https?:[/][/][^\s<>"'，。；：、）】]+|[/]files[/][^\s<>"'，。；：、）】]+)/g,'<a href="$1" target="_blank" rel="noopener">$1</a>');}
-async function send(e){e.preventDefault();
- const q=document.getElementById('q'); const t=q.value.trim(); if(!t) return; q.value='';
- const log=document.getElementById('log');
- log.innerHTML+=`<div class="me">你：${esc(t)}</div>`; log.scrollTop=log.scrollHeight;
- const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:t})});
- const d=await r.json();
- log.innerHTML+=`<div class="ai">助手：${linkify(d.reply||d.error||'出错了')}</div>`; log.scrollTop=log.scrollHeight;}
-</script></body></html>"""
-
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *a):  # 安静一点，别刷屏
+    def log_message(self, *a):  # 安静一点，别刷屏（日志走 observability）
         pass
+
+    # -- 请求上下文：每请求一个 id，每条日志带租户 id -------------------
+    def _begin_request(self):
+        self._request_id = (self.headers.get("X-Request-Id", "") or
+                            obs_logging.new_request_id())
+        self._request_started = time.monotonic()
+        self._tenant = ""
+        obs_metrics.inc(obs_metrics.REQUESTS)
 
     def _send(self, code, body, ctype="text/html; charset=utf-8"):
         data = body.encode() if isinstance(body, str) else body
@@ -97,72 +113,47 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+        if code >= 400:
+            obs_metrics.inc(obs_metrics.FAILURES)
+        obs_logging.emit(
+            "http_response", level="error" if code >= 500 else "info",
+            request_id=getattr(self, "_request_id", ""),
+            tenant=getattr(self, "_tenant", ""),
+            method=self.command, path=urlparse(self.path).path,
+            status=code,
+            duration_ms=round(
+                (time.monotonic() - getattr(
+                    self, "_request_started", time.monotonic())) * 1000, 1))
+
+    def _send_error(self, err: ApiError):
+        """按统一错误结构发 JSON 错误响应（状态码由 ApiError 自带）。"""
+        self._send(err.status, json.dumps(err.body(), ensure_ascii=False),
+                   "application/json")
 
     def _need_tenant(self):
         tenant = get_tenant(self)
         if not tenant:
-            self._send(401, json.dumps({"error": "未登录：请通过网关登录后再访问"},
-                                       ensure_ascii=False), "application/json")
+            self._send_error(unauthenticated(
+                "未登录：请通过网关登录后再访问"))
             return None
+        self._tenant = tenant
         return tenant
 
-    def _serve_file(self, tenant: str, rel: str):
-        """GET /files/<相对路径>：只发本租户 workspace 里的网页/静态文件。
-
-        鉴权在调用方（_need_tenant）；这里只管路径和后缀：
-        safe_path 会把 `..`、绝对路径、符号链接逃逸都挡在 workspace 内，
-        逃不出去的返回 403；点开头文件、.db/.sqlite/.env 和不在白名单的
-        后缀一律 403；不存在或是个目录就 404（目录不列表）。
-        二进制按字节读，Content-Type 按后缀显式映射，不猜错图片。
-        """
-        allowed = {
-            ".html": "text/html; charset=utf-8",
-            ".css": "text/css; charset=utf-8",
-            ".js": "text/javascript; charset=utf-8",
-            ".json": "application/json; charset=utf-8",
-            ".txt": "text/plain; charset=utf-8",
-            ".md": "text/markdown; charset=utf-8",
-            ".png": "image/png",
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".gif": "image/gif",
-            ".svg": "image/svg+xml",
-            ".webp": "image/webp",
-        }
-        rel = unquote(rel)
-        if rel.startswith("/"):
-            # /files//etc/passwd、/files/%2Fetc%2Fpasswd 这种绝对路径一律挡掉
-            return self._send(403, "forbidden", "text/plain")
-        if not rel or rel.endswith("/"):
-            return self._send(404, "not found", "text/plain")
-        try:
-            p = safe_path(tenant, rel)
-        except ValueError:
-            return self._send(403, "forbidden", "text/plain")
-        # safe_path 之后再按解析后的真实路径检查：workspace 里的符号链接
-        # 指到 memory.db 也会被后缀挡住；点开头文件（.env 等）一律不发。
-        if p.name.startswith(".") or p.suffix.lower() not in allowed:
-            return self._send(403, "forbidden", "text/plain")
-        if not p.is_file():
-            return self._send(404, "not found", "text/plain")
-        try:
-            data = p.read_bytes()
-        except OSError:
-            return self._send(404, "not found", "text/plain")
-        self._send(200, data, allowed[p.suffix.lower()])
-
     def do_GET(self):
+        self._begin_request()
         # 查询串（?token= 之类）只用来透传，路由只看路径部分。
         path = urlparse(self.path).path
         if path in ("/", "/index.html"):
-            self._send(200, PAGE)
+            self._send(200, CHAT_HTML)
         elif path == "/api/health":
-            self._send(200, json.dumps(
-                {"ok": True, "model": MODEL, "engine": "langgraph",
-                 "tenant": TENANT_ID or None,
-                 "single_tenant": SINGLE_TENANT_MODE,
-                 "sandbox_mode": os.environ.get(
-                     "SANDBOX_MODE", "docker")}), "application/json")
+            self._send(200, json.dumps(health_mod.health_payload(
+                model=MODEL, tenant=TENANT_ID or None,
+                single_tenant=SINGLE_TENANT_MODE,
+                sandbox_mode=os.environ.get("SANDBOX_MODE", "docker"))),
+                "application/json")
+        elif path == "/api/metrics":
+            self._send(200, obs_metrics.render_prometheus(),
+                       "text/plain; version=0.0.4; charset=utf-8")
         elif path == "/api/me":
             tenant = self._need_tenant()
             if tenant:
@@ -172,32 +163,42 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith("/files/"):
             tenant = self._need_tenant()
             if tenant:
-                self._serve_file(tenant, path[len("/files/"):])
+                serve_file(self, tenant, path[len("/files/"):])
         else:
-            self._send(404, "not found", "text/plain")
+            self._send_error(not_found())
 
     def do_POST(self):
+        self._begin_request()
         if self.path != "/api/chat":
-            return self._send(404, "not found", "text/plain")
+            return self._send_error(not_found())
         tenant = self._need_tenant()
         if not tenant:
             return
         try:
             payload = json.loads(self.rfile.read(
                 int(self.headers.get("Content-Length", 0)) or 0))
+        except ValueError:
+            return self._send_error(bad_request("消息不是合法的 JSON"))
+        if not isinstance(payload, dict):
+            return self._send_error(bad_request("消息不是合法的 JSON"))
+        try:
             text = (payload.get("message") or "").strip()
             if not text:
-                return self._send(400, json.dumps({"error": "消息是空的"}),
-                                  "application/json")
+                return self._send_error(bad_request("消息是空的"))
+            result = chat_with_events(tenant, text)
             self._send(200, json.dumps(
-                {"reply": chat(tenant, text), "tenant": tenant},
+                {"reply": result["reply"], "tenant": tenant,
+                 "events": result["events"]},
                 ensure_ascii=False), "application/json")
-        except Exception as e:  # noqa: BLE001 - 把错误原样告诉用户，方便调试
-            self._send(200, json.dumps({"error": str(e)}, ensure_ascii=False),
-                       "application/json")
+        except Exception as e:  # noqa: BLE001 - 模型失败按 500 统一错误结构返回
+            if "只服务租户" in str(e):
+                return self._send_error(
+                    tenant_isolation_violation(str(e)))
+            return self._send_error(model_failure(f"模型调用失败：{e}"))
 
 
 def main():
+    obs_logging.setup_logging()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     start_reminder_scheduler()
     print(f"多租户 Agent API 跑起来了：http://localhost:{PORT}  模型={MODEL} 引擎=langgraph")
