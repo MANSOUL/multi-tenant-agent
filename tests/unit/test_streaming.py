@@ -278,3 +278,23 @@ class TestGatewayProxyStreaming(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBothPagesStream(unittest.TestCase):
+    """两个聊天入口都要走流式：租户容器的 chat.html 和网关的
+    login.html（用户实际是在登录页里聊天，2026-11-27 实测发现
+    login.html 还调老接口——这个测试就是防它再漏掉）。"""
+
+    def test_chat_html_uses_stream(self):
+        from pathlib import Path
+        html = (Path(__file__).resolve().parents[2] / "agent" / "web"
+                / "chat.html").read_text(encoding="utf-8")
+        self.assertIn("/api/chat/stream", html)
+        self.assertIn("思考过程", html)
+
+    def test_login_html_uses_stream(self):
+        from pathlib import Path
+        html = (Path(__file__).resolve().parents[2] / "gateway" / "web"
+                / "login.html").read_text(encoding="utf-8")
+        self.assertIn("/api/chat/stream", html)
+        self.assertIn("思考过程", html)
