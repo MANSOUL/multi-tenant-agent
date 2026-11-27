@@ -17,7 +17,9 @@ try:
     from agent.config import MODEL, TENANT_ID
     from agent.memory import extract_explicit, mark_notifications_delivered
     from agent.tenant import checkpoint_db_path, tenant_db
-    from context.assembler import assemble_context, build_system_prompt
+    from context.assembler import (
+        assemble_context, build_system_prompt,
+        messages_cover_history)
     from infra import checkpoints as checkpoints_mod
     from loop.config import AgentLoopConfig
     from loop.hooks import LoopHooks
@@ -36,7 +38,9 @@ except ImportError:  # 以脚本方式跑时项目根目录不在 path 上
     from agent.config import MODEL, TENANT_ID
     from agent.memory import extract_explicit, mark_notifications_delivered
     from agent.tenant import checkpoint_db_path, tenant_db
-    from context.assembler import assemble_context, build_system_prompt
+    from context.assembler import (
+        assemble_context, build_system_prompt,
+        messages_cover_history)
     from infra import checkpoints as checkpoints_mod
     from loop.config import AgentLoopConfig
     from loop.hooks import LoopHooks
@@ -71,7 +75,13 @@ class AgentState(TypedDict):
 
 def _system_prompt(state: AgentState) -> str:
     """拼系统提示（实现在 context/assembler.build_system_prompt，
-    这里只把 state 转成 ctx 传过去；注入标注有就追加在最后）。"""
+    这里只把 state 转成 ctx 传过去；注入标注有就追加在最后）。
+
+    去重：消息列表里已经带了往轮历史时（checkpointer 下的常规
+    情况），系统提示里不再拼同一段历史文本——同一段历史发两遍
+    是 2026-11-27 实测 36K 输入 token 的大头之一。新会话、没开
+    checkpointer 时消息列表里只有本轮，历史仍走系统提示，不丢。
+    """
     ctx = {
         "due_notifications": state.get("due_notifications"),
         "summary": state.get("summary"),
@@ -80,7 +90,9 @@ def _system_prompt(state: AgentState) -> str:
         "todos": state.get("todos"),
         "reminders": state.get("reminders"),
     }
-    prompt = build_system_prompt(ctx)
+    prompt = build_system_prompt(
+        ctx, include_history=not messages_cover_history(
+            state.get("messages")) )
     note = state.get("guardrail_note") or ""
     if note:
         prompt += "\n\n" + note

@@ -179,10 +179,29 @@ def assemble_context(tenant: str, llm=None, max_turns=None, max_chars=None,
             "summarized": summarized, "truncated": truncated}
 
 
-def build_system_prompt(ctx: dict) -> str:
+def messages_cover_history(messages) -> bool:
+    """消息列表里是不是已经带了往轮的历史（不止本轮这一条用户消息）。
+
+    带 checkpointer 时 state["messages"] 是整段会话的消息：有往轮
+    消息就返回 True，调用方就不用再把同一段历史以文本形式拼进系统
+    提示（去重）。没开 checkpointer、或是新会话（只有本轮一条用户
+    消息）时返回 False，历史仍走系统提示里的 history_text，跨会话
+    的历史不会丢。
+    """
+    real = [m for m in (messages or [])
+            if getattr(m, "type", "") != "system"]
+    return len(real) > 1
+
+
+def build_system_prompt(ctx: dict, include_history: bool = True) -> str:
     """拼系统提示：待送达提醒 → 摘要 → 长期事实 → 最近对话 → 待办/提醒 → 工具说明。
     待送达提醒放最前面，模型先看到、先当面提醒用户。
-    系统提示和最新用户消息永远不截断，只截旧历史/旧事实。"""
+    系统提示和最新用户消息永远不截断，只截旧历史/旧事实。
+
+    include_history=False 时不拼“最近的对话”：调用方在消息列表
+    里已经带了同一段历史时用（去重，见 messages_cover_history）。
+    摘要、事实、待办、提醒不受影响，照常拼——它们不在消息列表里。
+    """
     system = SYSTEM_PROMPT + "\n" + TOOLS_DOC
     for n in ctx.get("due_notifications") or []:
         system += (f"\n\n【待提醒】{n['text']}"
@@ -191,7 +210,7 @@ def build_system_prompt(ctx: dict) -> str:
         system += f"\n\n较早对话的摘要：\n{ctx['summary']}"
     if ctx.get("facts"):
         system += f"\n\n你记得的关于这个用户的事：\n{ctx['facts']}"
-    if ctx.get("history_text"):
+    if include_history and ctx.get("history_text"):
         system += f"\n\n最近的对话：\n{ctx['history_text']}"
     if ctx.get("todos"):
         system += f"\n\n未完成的待办：\n{ctx['todos']}"
