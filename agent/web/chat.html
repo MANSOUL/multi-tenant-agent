@@ -143,6 +143,10 @@ async function send(e){e.preventDefault();
  const tlog=wrap.querySelector('.tlog'), ans=wrap.querySelector('.answer');
  const thinking=wrap.querySelector('.think');
  let buf='', answer='', gotEvent=false, settled=false;
+ let reasonEl=null;
+ function thinkReasoning(text){ // 推理是按 token 流的：都追加进同一个 div，成一段话，不一行一个字
+  if(!reasonEl){ reasonEl=document.createElement('div'); tlog.appendChild(reasonEl); }
+  reasonEl.textContent+=text; }
  function finish(){ if(settled) return; settled=true;
    ans.innerHTML=renderMarkdown(answer)||'<span class="err">出错了</span>';
    thinking.open=false; log.scrollTop=log.scrollHeight; }
@@ -166,7 +170,7 @@ async function send(e){e.preventDefault();
      let ev; try{ ev=JSON.parse(line.slice(5).trim()); }catch(_){ continue; }
      gotEvent=true;
      if(ev.type==='status'){ thinkLine(tlog, ev.text||ev.stage); }
-     else if(ev.type==='reasoning'){ thinkLine(tlog, '💭 '+ev.text); }
+     else if(ev.type==='reasoning'){ thinkReasoning(ev.text); }
      else if(ev.type==='token'){ answer+=ev.text; ans.innerHTML=renderMarkdown(answer); }
      else if(ev.type==='tool_call'){ thinkLine(tlog, '🔧 调用工具 '+ev.name+'('+JSON.stringify(ev.args||{})+')'); }
      else if(ev.type==='tool_result'){ thinkLine(tlog, '✓ '+(ev.name||'工具')+' 返回：'+(ev.result||'')); }

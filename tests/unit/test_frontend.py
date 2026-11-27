@@ -54,6 +54,25 @@ class TestNewChatUi(unittest.TestCase):
             self.assertIn('id="q"', page)
 
 
+class TestReasoningCoalesced(unittest.TestCase):
+    """思考过程：reasoning 按 token 流，不能每个 chunk 一行。
+
+    回归（2026-11-27）：之前每个 reasoning chunk 都新建一个 div，
+    一句话被拆成几十行单字，特别占地方。现在所有 reasoning 文本
+    追加进同一个 div，成一段话；status/tool_call 等离散阶段仍各占一行。
+    """
+    def test_reasoning_appended_to_one_element(self):
+        for page in (CHAT, LOGIN):
+            self.assertIn("thinkReasoning", page)
+            self.assertIn("reasonEl", page)
+            self.assertNotIn("thinkLine(tlog, '💭 '+ev.text)", page)
+
+    def test_stage_lines_still_separate(self):
+        for page in (CHAT, LOGIN):
+            self.assertIn("thinkLine(tlog, ev.text||ev.stage)", page)
+            self.assertIn("thinkLine(tlog, '🔧 调用工具 '", page)
+
+
 class TestSessionRestore(unittest.TestCase):
     def test_login_page_restores_from_cookie(self):
         # 刷新后：问一句 /api/me，认得出就进聊天；JS 不读不存 token。
