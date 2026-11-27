@@ -2,7 +2,7 @@
 
 这里的值全是测试专用的假值：TENANT_ID=demo、TOKEN_SECRET 和
 GATEWAY_SECRET 用同一个测试密钥（网关签发的 token 才能被 agent 认出来）、
-LLM_API_KEY 是假 key（e2e 测试会把 ChatOpenAI 换成剧本假模型，绝不调真实接口）。
+LLM_API_KEY 是假 key（e2e 测试会把 ChatDeepSeek 换成剧本假模型，绝不调真实接口）。
 DATA_DIR 强制指向一个临时目录，任何测试都碰不到项目真正的 data/。
 """
 import os

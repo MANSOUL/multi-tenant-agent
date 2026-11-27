@@ -33,7 +33,7 @@ class _SessionCase(unittest.TestCase):
     def setUp(self):
         self._ctx = fresh_tenant_data()
         self._ctx.__enter__()
-        self._llm = mock.patch.object(client_mod, "ChatOpenAI", _FakeLLM)
+        self._llm = mock.patch.object(client_mod, "ChatDeepSeek", _FakeLLM)
         self._llm.start()
         self.manager = SessionManager()
 
@@ -106,22 +106,22 @@ class TestGraphReuse(_SessionCase):
 
     def test_same_session_reuses_graph(self):
         g1 = self.manager.get_graph("demo", "default", build_graph,
-                                    salt=id(client_mod.ChatOpenAI))
+                                    salt=id(client_mod.ChatDeepSeek))
         g2 = self.manager.get_graph("demo", "default", build_graph,
-                                    salt=id(client_mod.ChatOpenAI))
+                                    salt=id(client_mod.ChatDeepSeek))
         self.assertIs(g1, g2)
 
     def test_different_sessions_get_different_graphs(self):
         g1 = self.manager.get_graph("demo", "default", build_graph,
-                                    salt=id(client_mod.ChatOpenAI))
+                                    salt=id(client_mod.ChatDeepSeek))
         g2 = self.manager.get_graph("demo", "sess-other", build_graph,
-                                    salt=id(client_mod.ChatOpenAI))
+                                    salt=id(client_mod.ChatDeepSeek))
         self.assertIsNot(g1, g2)
 
     def test_drop_graph_rebuilds(self):
         g1 = self.manager.get_graph("demo", "default", build_graph,
-                                    salt=id(client_mod.ChatOpenAI))
+                                    salt=id(client_mod.ChatDeepSeek))
         self.manager.drop_graph("demo", "default")
         g2 = self.manager.get_graph("demo", "default", build_graph,
-                                    salt=id(client_mod.ChatOpenAI))
+                                    salt=id(client_mod.ChatDeepSeek))
         self.assertIsNot(g1, g2)

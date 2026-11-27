@@ -57,7 +57,9 @@ SCHEMA_STATEMENTS = [
     "CREATE TABLE IF NOT EXISTS metering"
     "(id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT, model TEXT,"
     " ts TEXT, tokens_input INTEGER, tokens_output INTEGER,"
-    " tokens_total INTEGER, cost_estimate REAL)",
+    " tokens_total INTEGER, cost_estimate REAL,"
+    " tokens_reasoning INTEGER DEFAULT 0,"
+    " tokens_cached INTEGER DEFAULT 0)",
     # P3 Turn 记录：每轮一条（store/turns.py）。
     "CREATE TABLE IF NOT EXISTS turns"
     "(id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, tenant TEXT,"
@@ -358,12 +360,13 @@ class SQLiteStore:
     # -- metering（P3，模型调用计量：实现在 model/metering.py，
     #    这里只委托，和 event_log 的委托方式一样）-----------------------
     def record_metering(self, tenant: str, model: str, input_text: str = "",
-                        output_text: str = "", cost_estimate: float = 0.0
-                        ) -> int:
-        """记一次模型调用（token 按文本粗估，best-effort；成本先留 0.0）。"""
+                        output_text: str = "", cost_estimate: float | None = None,
+                        usage: dict | None = None) -> int:
+        """记一次模型调用：usage 给了记真实用量 + 按价目表算成本，
+        没给按文本粗估、成本 0.0（老行为）。"""
         return metering_mod.record_call(
             self.conn, tenant, model, input_text, output_text,
-            cost_estimate=cost_estimate)
+            cost_estimate=cost_estimate, usage=usage)
 
     def metering_summary(self, tenant: str) -> dict:
         """按租户汇总计量：调用次数、token 合计、成本估算合计。"""

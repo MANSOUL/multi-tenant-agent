@@ -75,7 +75,8 @@ class TestPostgresSchema(unittest.TestCase):
         conn = _FakeConn()
         ensure_schema(conn)
         sqls = _sqls(conn.cursor_obj)
-        self.assertEqual(len(sqls), len(SCHEMA_STATEMENTS))
+        # 11 张建表 + P6 的 2 条 metering 补列（老表迁移）。
+        self.assertEqual(len(sqls), len(SCHEMA_STATEMENTS) + 2)
         joined = "\n".join(sqls)
         for table in ("facts", "chat_log", "summaries", "todos",
                       "reminders", "pending_notifications", "chat_archived",
@@ -97,7 +98,8 @@ class TestPostgresSchema(unittest.TestCase):
         sqls = _sqls(conn.cursor_obj)
         self.assertIn('CREATE SCHEMA IF NOT EXISTS "demo"', sqls[0])
         self.assertIn('SET search_path TO "demo"', sqls[1])
-        self.assertEqual(len(sqls), len(SCHEMA_STATEMENTS) + 2)
+        # 建 schema + 切 search_path（2 条）+ 11 张建表 + P6 的 2 条补列。
+        self.assertEqual(len(sqls), len(SCHEMA_STATEMENTS) + 4)
 
     def test_invalid_schema_name_rejected(self):
         conn = _FakeConn()
@@ -253,13 +255,14 @@ class TestPostgresMeteringTurns(unittest.TestCase):
         _assert_no_question_mark(self, cur)
 
     def test_metering_summary_aggregates(self):
-        cur = _FakeCursor(fetchone=(3, 10, 20, 30, 0.0))
+        cur = _FakeCursor(fetchone=(3, 10, 20, 30, 0.0, 7, 4))
         store = PostgresStore(_FakeConn(cur))
         summary = store.metering_summary("demo")
         self.assertEqual(summary, {
             "tenant": "demo", "model_calls": 3, "tokens_input": 10,
             "tokens_output": 20, "tokens_total": 30,
-            "cost_estimate": 0.0, "metering": "available"})
+            "cost_estimate": 0.0, "tokens_reasoning": 7,
+            "tokens_cached": 4, "metering": "available"})
         sql, params = cur.executed[0]
         self.assertIn("WHERE tenant = %s", sql)
         self.assertEqual(params, ("demo",))

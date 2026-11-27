@@ -221,11 +221,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_chat_stream(tenant, text, session_id)
         try:
             result = chat_with_events(tenant, text, session_id)
-            self._send(200, json.dumps(
-                {"reply": result["reply"], "tenant": tenant,
-                 "events": result.get("events", []),
-                 "session_id": result.get("session_id", "default")},
-                ensure_ascii=False), "application/json")
+            payload = {"reply": result["reply"], "tenant": tenant,
+                       "events": result.get("events", []),
+                       "session_id": result.get("session_id", "default")}
+            if result.get("usage") is not None:
+                payload["usage"] = result["usage"]
+                payload["tenant_usage"] = result.get("tenant_usage")
+            self._send(200, json.dumps(payload, ensure_ascii=False),
+                       "application/json")
         except Exception as e:  # noqa: BLE001 - 模型失败按 500 统一错误结构返回
             if "只服务租户" in str(e):
                 return self._send_error(

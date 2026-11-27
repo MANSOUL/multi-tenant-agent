@@ -1,4 +1,4 @@
-"""P4 checkpointer（e2e，走 ChatService 整条图，假模型替掉 ChatOpenAI）。
+"""P4 checkpointer（e2e，走 ChatService 整条图，假模型替掉 ChatDeepSeek）。
 
 验收：同一会话连续两轮对话，第二轮能引用第一轮的工具结果。
 假模型（_CheckpointLLM）只认本文件两个场景：第一轮调 remember_fact
@@ -61,7 +61,7 @@ class _CheckpointCase(unittest.TestCase):
     def setUp(self):
         self._ctx = fresh_tenant_data()
         self._data_dir = self._ctx.__enter__()
-        self._llm = mock.patch.object(client_mod, "ChatOpenAI",
+        self._llm = mock.patch.object(client_mod, "ChatDeepSeek",
                                       _CheckpointLLM)
         self._llm.start()
         self.service = ChatService(session_manager=SessionManager())

@@ -33,6 +33,7 @@ try:
     from loop.loop import run_graph
     from model import client as client_mod
     from model.client import has_api_key
+    from model.metering import extract_usage
     from security.guardrails import check_injection, guardrail_note, log_injection
     from session.session import DEFAULT_SESSION_ID, SessionManager
     from store import create_store
@@ -56,10 +57,12 @@ except ImportError:  # 以脚本方式跑时项目根目录在 path 上
     from loop.loop import run_graph
     from model import client as client_mod
     from model.client import has_api_key
+    from model.metering import extract_usage
     from security.guardrails import check_injection, guardrail_note, log_injection
     from session.session import DEFAULT_SESSION_ID, SessionManager
     from store import create_store
     from app.reminder_service import PERIOD_WORDS, ReminderService
+    from model.metering import extract_usage
 
 from langchain_core.messages import HumanMessage
 
@@ -116,10 +119,10 @@ class ChatService:
 
         graph = self.sessions.get_graph(
             tenant, sid, self._graph_builder,
-            # 注意：必须每次从 model.client 模块上现读 ChatOpenAI 再取
+            # 注意：必须每次从 model.client 模块上现读 ChatDeepSeek 再取
             # id——from-import 抓到的名字是旧引用，测试换假模型时盐值
             # 不变，旧图会被误复用（已实测踩过这个坑）。
-            salt=id(client_mod.ChatOpenAI))
+            salt=id(client_mod.ChatDeepSeek))
         # P4：读本轮之前该会话在 checkpointer 里已存的消息条数，
         # 用来给 collect_events 切片（只推本轮新产生的工具调用事件）。
         # 没开 checkpointer 时是 0，切片等于全量，老行为不变。
@@ -138,10 +141,16 @@ class ChatService:
             raise RuntimeError(f"模型调用失败：{e}")
         reply = _extract_reply(result)
         self._record_turn(tenant, sid, user_text, reply, started_at)
-        return {"reply": reply,
-                "events": collect_events(result,
-                                         since_index=prior_messages),
-                "session_id": sid}
+        usage = _usage_from_messages(result.get("messages"),
+                                     since_index=prior_messages)
+        out = {"reply": reply,
+               "events": collect_events(result,
+                                        since_index=prior_messages),
+               "session_id": sid}
+        if usage is not None:
+            out["usage"] = {"model": MODEL, **usage}
+            out["tenant_usage"] = _tenant_usage(tenant)
+        return out
 
     # -- 流式入口（P5，SSE 思考过程）--------------------------------------
     def chat_stream(self, tenant: str, user_text: str,
@@ -201,9 +210,10 @@ class ChatService:
 
         graph = self.sessions.get_graph(
             tenant, sid, self._graph_builder,
-            salt=id(client_mod.ChatOpenAI))
+            salt=id(client_mod.ChatDeepSeek))
         events: list = []
         reply_parts: list = []
+        stream_usages: list = []
         tool_names_by_id: dict = {}
         try:
             for mode, payload in stream_graph(
@@ -216,6 +226,12 @@ class ChatService:
                     self.loop_config, thread_id=sid):
                 if mode == "messages":
                     chunk, _meta = payload
+                    # 每轮的最后一个 chunk 带那轮的真实用量
+                    # （stream_usage=True），收到就攒起来，结束时
+                    # 加总成一轮的用量发 usage 事件。
+                    chunk_usage = extract_usage(chunk)
+                    if chunk_usage is not None:
+                        stream_usages.append(chunk_usage)
                     reasoning = _chunk_reasoning(chunk)
                     if reasoning:
                         yield {"type": "reasoning", "text": reasoning}
@@ -276,8 +292,19 @@ class ChatService:
             return
         reply = "".join(reply_parts)
         self._record_turn(tenant, sid, user_text, reply, started_at)
-        yield {"type": "done", "reply": reply, "events": events,
-               "session_id": sid}
+        done = {"type": "done", "reply": reply, "events": events,
+                "session_id": sid}
+        stream_usage = _sum_usages(stream_usages)
+        if stream_usage is not None:
+            usage_event = {"type": "usage", **stream_usage}
+            tenant_totals = _tenant_usage(tenant)
+            if tenant_totals is not None:
+                usage_event["tenant_usage"] = tenant_totals
+            yield usage_event
+            done["usage"] = stream_usage
+            if tenant_totals is not None:
+                done["tenant_usage"] = tenant_totals
+        yield done
 
     def chat_text(self, tenant: str, user_text: str,
                   session_id: str | None = None) -> str:
@@ -329,6 +356,56 @@ class ChatService:
                     datetime.now(timezone.utc).isoformat())
         except Exception:
             pass
+
+
+def _sum_usages(usages) -> dict | None:
+    """把多次模型调用的用量加总成“本轮用量”（成本按合计 token
+    一次算；同一轮里的调用都在同一高峰/非高峰时段，结果一致）。
+    没有用量时返回 None。"""
+    from model.pricing import cost_usd
+
+    total = None
+    for usage in usages:
+        if usage is None:
+            continue
+        if total is None:
+            total = {"model": MODEL, "input_tokens": 0, "cached_tokens": 0,
+                     "output_tokens": 0, "reasoning_tokens": 0,
+                     "total_tokens": 0}
+        for key in ("input_tokens", "cached_tokens", "output_tokens",
+                    "reasoning_tokens", "total_tokens"):
+            total[key] += usage.get(key, 0)
+    if total is None:
+        return None
+    total["cost_usd"] = cost_usd(
+        MODEL, total["input_tokens"], total["cached_tokens"],
+        total["output_tokens"])
+    return total
+
+
+def _usage_from_messages(messages, since_index: int | None = None
+                         ) -> dict | None:
+    """从一轮图执行结果的消息里加总本轮的真实用量。
+
+    一轮里可能调多次模型（工具轮），每条 AIMessage 的 usage_metadata
+    是一次调用的量，加起来才是本轮用量；有 checkpointer 时只取
+    since_index 之后的消息（本轮新产生的），不把历史轮次的也加进来。
+    每一笔调用的明细都在 metering 表里，不丢。
+    """
+    msgs = messages or []
+    if since_index is not None:
+        msgs = msgs[since_index:]
+    return _sum_usages(extract_usage(m) for m in msgs)
+
+
+def _tenant_usage(tenant: str) -> dict | None:
+    """读该租户的累计用量汇总（metering_summary），失败返回 None，
+    绝不阻塞聊天。"""
+    try:
+        with tenant_db(tenant) as conn:
+            return create_store(conn).metering_summary(tenant)
+    except Exception:
+        return None
 
 
 # -- 模块级默认实例：agent/graph.py 的 chat() 调这里 ----------------------

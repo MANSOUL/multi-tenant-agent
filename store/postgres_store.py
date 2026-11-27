@@ -77,7 +77,9 @@ SCHEMA_STATEMENTS = [
     "CREATE TABLE IF NOT EXISTS metering"
     "(id SERIAL PRIMARY KEY, tenant TEXT, model TEXT, ts TEXT,"
     " tokens_input INTEGER, tokens_output INTEGER, tokens_total INTEGER,"
-    " cost_estimate DOUBLE PRECISION)",
+    " cost_estimate DOUBLE PRECISION,"
+    " tokens_reasoning INTEGER DEFAULT 0,"
+    " tokens_cached INTEGER DEFAULT 0)",
     "CREATE TABLE IF NOT EXISTS turns"
     "(id SERIAL PRIMARY KEY, session_id TEXT, tenant TEXT,"
     " working_dir TEXT, approval_policy TEXT, sandbox_mode TEXT,"
@@ -108,6 +110,11 @@ def ensure_schema(conn, schema: str | None = None) -> None:
         _execute(conn, f'SET search_path TO "{schema}"')
     for stmt in SCHEMA_STATEMENTS:
         _execute(conn, stmt)
+    # P6：已建好的 metering 表补两列（新表上面已经带了这两列）。
+    for col, ddl in (("tokens_reasoning", "INTEGER DEFAULT 0"),
+                     ("tokens_cached", "INTEGER DEFAULT 0")):
+        _execute(conn, "ALTER TABLE metering ADD COLUMN IF NOT EXISTS "
+                       f"{col} {ddl}")
 
 
 def connect(dsn: str | None = None):
@@ -484,22 +491,38 @@ class PostgresStore:
     #    token 粗估、cost_estimate 留 0.0；这里是 Postgres 方言直译，
     #    不复用 metering.py——它只会 SQLite 的 ? 占位符）----------------
     def record_metering(self, tenant: str, model: str, input_text: str = "",
-                        output_text: str = "", cost_estimate: float = 0.0
-                        ) -> int:
+                        output_text: str = "", cost_estimate: float | None = None,
+                        usage: dict | None = None) -> int:
         """记一次模型调用，返回行 id（INSERT ... RETURNING id；
-        psycopg2 的 cursor 没有 lastrowid）。"""
+        psycopg2 的 cursor 没有 lastrowid）。usage 给了记真实用量
+        + 按价目表算成本，没给按文本粗估、成本 0.0（老行为）。"""
         from datetime import datetime, timezone
 
-        tokens_input = estimate_tokens(input_text)
-        tokens_output = estimate_tokens(output_text)
+        from model.pricing import cost_usd
+
+        if usage is not None:
+            tokens_input = usage.get("input_tokens", 0)
+            tokens_output = usage.get("output_tokens", 0)
+            reasoning = usage.get("reasoning_tokens", 0)
+            cached = usage.get("cached_tokens", 0)
+            if cost_estimate is None:
+                cost_estimate = cost_usd(
+                    model, tokens_input, cached, tokens_output)
+        else:
+            tokens_input = estimate_tokens(input_text)
+            tokens_output = estimate_tokens(output_text)
+            reasoning, cached = 0, 0
+            if cost_estimate is None:
+                cost_estimate = 0.0
         row = _execute(
             self.conn,
             "INSERT INTO metering (tenant, model, ts, tokens_input,"
-            " tokens_output, tokens_total, cost_estimate)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            " tokens_output, tokens_total, cost_estimate,"
+            " tokens_reasoning, tokens_cached)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
             (tenant, model, datetime.now(timezone.utc).isoformat(),
              tokens_input, tokens_output, tokens_input + tokens_output,
-             cost_estimate)).fetchone()
+             cost_estimate, reasoning, cached)).fetchone()
         return row[0]
 
     def metering_summary(self, tenant: str) -> dict:
@@ -508,13 +531,16 @@ class PostgresStore:
             self.conn,
             "SELECT COUNT(*), COALESCE(SUM(tokens_input), 0),"
             " COALESCE(SUM(tokens_output), 0), COALESCE(SUM(tokens_total), 0),"
-            " COALESCE(SUM(cost_estimate), 0.0) FROM metering"
+            " COALESCE(SUM(cost_estimate), 0.0),"
+            " COALESCE(SUM(tokens_reasoning), 0),"
+            " COALESCE(SUM(tokens_cached), 0) FROM metering"
             " WHERE tenant = %s",
             (tenant,)).fetchone()
-        calls, tok_in, tok_out, tok_total, cost = row
+        calls, tok_in, tok_out, tok_total, cost, tok_reason, tok_cached = row
         return {"tenant": tenant, "model_calls": calls,
                 "tokens_input": tok_in, "tokens_output": tok_out,
                 "tokens_total": tok_total, "cost_estimate": cost,
+                "tokens_reasoning": tok_reason, "tokens_cached": tok_cached,
                 "metering": "available"}
 
     # -- turns（P3，每轮 Turn 记录：和 store/turns.py 同字段，

@@ -24,6 +24,11 @@
 - `tenant`（string）：租户 id。和原来一样。
 - `events`（array）：本轮产生的事件，**始终出现**；没有事件时是空数组 `[]`，
   不会省略这个字段。前端可以无条件 `d.events || []`。
+- `usage`（object，v1.2 起）：本轮真实用量（`model` / `input_tokens` /
+  `cached_tokens` / `output_tokens` / `reasoning_tokens` / `total_tokens` /
+  `cost_usd`），没有真实用量时省略；`tenant_usage`（object，v1.2 起）：
+  该租户的累计用量（`model_calls` / `tokens_total` / `cost_estimate`），
+  和 `usage` 一起出现。
 
 ## 2. 事件类型
 
@@ -54,7 +59,8 @@
 | `tool_call` | 本轮模型调了一次工具（字段和 v1.0 的同名事件一致） | `name`；`args` |
 | `tool_result` | 工具跑完（结果截到 200 字，不把大输出塞进流里） | `name`；`result` |
 | `reminder_delivered` | 本轮把一条到点提醒当面告诉了用户（字段和 v1.0 一致） | `notification_id`；`text`；`due_at` |
-| `done` | 整轮结束，流的最后一个事件 | `reply`：完整回复文本；`events`：本轮的 `tool_call` / `tool_result` / `reminder_delivered` 汇总（`status` / `token` / `reasoning` 不进汇总）；`session_id` |
+| `done` | 整轮结束，流的最后一个事件 | `reply`：完整回复文本；`events`：本轮的 `tool_call` / `tool_result` / `reminder_delivered` 汇总（`status` / `token` / `reasoning` 不进汇总）；`session_id`；`usage`：有真实用量时带本轮用量（字段见下），没有时省略；`tenant_usage`：有 `usage` 时带租户累计 |
+| `usage` | 整轮用量，`done` 之前发（每轮一次） | `model`：模型名；`input_tokens` / `cached_tokens`（输入里命中缓存的部分） / `output_tokens` / `reasoning_tokens`（输出里思考的部分，已含在 `output_tokens` 里） / `total_tokens`；`cost_usd`：按 DeepSeek 价目表算的本轮成本估算（美元，见 model/pricing.py）；`tenant_usage`：租户累计（`model_calls` / `tokens_total` / `cost_estimate`） |
 | `error` | 出错，流的最后一个事件（再无 `done`） | `code`：第 3 节的错误码；`message`：中文说明 |
 
 注意：`token` 增量是模型原样吐出来的——工具轮的简短铺垫
@@ -113,6 +119,10 @@
   `tool_result` / `reminder_delivered` / `done` / `error`）；v1.0 的
   `/api/chat` 和事件含义一字不改。`chat` 占位类型被 `token` 替代，
   不再启用。
+- v1.2（2026-11-27，P6）：加 `usage` 流事件和 `done` / `/api/chat`
+  响应里的 `usage` + `tenant_usage`（真实用量，见第 2.5 节）；模型
+  换成 `deepseek-reasoner`（ChatDeepSeek，推理文本进 `reasoning`
+  事件）。用量没有时（假模型、老客户端）字段省略，前端按无用量处理。
 - 演进规则（只加不改）：以后只加新字段、新事件类型，不改现有字段的含义、
   不删字段、不把可选字段改成必填。`chat` 事件类型已占位，流式回复时再启用。
   破坏性改动必须升大版本并先改本文档。

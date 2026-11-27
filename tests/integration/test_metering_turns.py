@@ -40,7 +40,7 @@ class _MeteringCase(unittest.TestCase):
     def setUp(self):
         self._ctx = fresh_tenant_data()
         self._ctx.__enter__()
-        self._llm = mock.patch.object(client_mod, "ChatOpenAI", _FakeLLM)
+        self._llm = mock.patch.object(client_mod, "ChatDeepSeek", _FakeLLM)
         self._llm.start()
 
     def tearDown(self):

@@ -1,4 +1,4 @@
-"""原对话逐句场景（e2e，走 chat() 整条图，假模型替掉 ChatOpenAI）。
+"""原对话逐句场景（e2e，走 chat() 整条图，假模型替掉 ChatDeepSeek）。
 
 场景来源：VERIFY.md 修复一节“仍需服务器实测”列的原对话。
 假模型（ScriptedLLM）只按剧本回应：它按上一条用户消息和系统提示里的
@@ -103,7 +103,7 @@ class _BuggyDialogueCase(unittest.TestCase):
     def setUp(self):
         self._ctx = fresh_tenant_data()
         self._ctx.__enter__()
-        self._llm = mock.patch.object(client_mod, "ChatOpenAI",
+        self._llm = mock.patch.object(client_mod, "ChatDeepSeek",
                                       BuggyConfirmLLM)
         self._llm.start()
 
@@ -146,7 +146,7 @@ class _DialogueCase(unittest.TestCase):
         self._ctx = fresh_tenant_data()
         self._ctx.__enter__()
         # P0 后模型创建收进 model/client.py，假模型贴在新的缝上。
-        self._llm = mock.patch.object(client_mod, "ChatOpenAI", ScriptedLLM)
+        self._llm = mock.patch.object(client_mod, "ChatDeepSeek", ScriptedLLM)
         self._llm.start()
 
     def tearDown(self):

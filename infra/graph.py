@@ -23,6 +23,8 @@ try:
     from loop.hooks import LoopHooks
     from loop.loop import decide_next
     from model.client import create_client, invoke
+    from model.metering import extract_usage
+    from model.metering import extract_usage
     from observability import metrics as obs_metrics
     from store import create_store
     from tools.permissions import DENY, log_audit
@@ -40,6 +42,8 @@ except ImportError:  # 以脚本方式跑时项目根目录不在 path 上
     from loop.hooks import LoopHooks
     from loop.loop import decide_next
     from model.client import create_client, invoke
+    from model.metering import extract_usage
+    from model.metering import extract_usage
     from observability import metrics as obs_metrics
     from store import create_store
     from tools.permissions import DENY, log_audit
@@ -84,14 +88,20 @@ def _system_prompt(state: AgentState) -> str:
 
 
 def _record_metering(tenant: str, input_text: str, reply) -> None:
-    """记一笔模型调用计量（失败不阻塞聊天）。"""
+    """记一笔模型调用计量（失败不阻塞聊天）。
+
+    有真实用量（reply.usage_metadata，P6 起 ChatDeepSeek +
+    stream_usage 保证有）就记真实数 + 按价目表算成本；没有就
+    退回按文本粗估（假模型、老客户端）。
+    """
     try:
+        usage = extract_usage(reply)
         output_text = reply.content if isinstance(reply.content, str) \
             else "".join(p.get("text", "") for p in reply.content
                          if isinstance(p, dict) and p.get("type") == "text")
         with tenant_db(tenant) as conn:
             create_store(conn).record_metering(
-                tenant, MODEL, input_text, output_text)
+                tenant, MODEL, input_text, output_text, usage=usage)
     except Exception:
         pass
 
@@ -115,10 +125,11 @@ def build_graph(tenant: str, loop_config: AgentLoopConfig | None = None,
     hooks = hooks or LoopHooks()
     tools = make_tools(tenant)
     tools_by_name = {t.name: t for t in tools}
-    # streaming=True：invoke() 仍返回完整消息，同时 graph.stream
-    # (stream_mode="messages") 能拿到逐 token 增量；流式和非流式
-    # 两条路共用这张图（见 model/client.py 的说明）。
-    llm = create_client(streaming=True)
+    # 客户端默认就是 streaming + stream_usage（见 model/client.py）：
+    # invoke() 仍返回完整消息，同时 graph.stream (stream_mode=
+    # "messages") 能拿到逐 token 增量和最后一个 chunk 的真实用量；
+    # 流式和非流式两条路共用这张图。
+    llm = create_client()
     llm_with_tools = llm.bind_tools(tools)
 
     def recall_memory(state: AgentState) -> dict:
